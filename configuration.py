@@ -98,7 +98,9 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
     bot_config = _as_table(config_data.get("bot"), name="bot")
     dashboard_config = _as_table(config_data.get("dashboard"), name="dashboard")
 
-    token = _get_required_string(telegram_config, "bot_token", section="telegram")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("Missing required TELEGRAM_BOT_TOKEN environment variable")
     owner_user_id = _get_required_positive_int(telegram_config, "bot_owner_user_id", section="telegram")
     trusted_user_ids = _get_positive_int_list(telegram_config, "trusted_user_ids", section="telegram")
 

@@ -1,5 +1,5 @@
 [telegram]
-bot_token = "replace-with-telegram-bot-token"
+# Set TELEGRAM_BOT_TOKEN in your environment.
 bot_owner_user_id = 123456789
 # Optional additional users the bot will accept messages from.
 # In non-DM chats, these users must still mention the bot (or reply to one of its messages).

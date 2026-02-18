@@ -15,7 +15,8 @@ Telegram bot using `python-telegram-bot` with a bounded concurrent queue worker 
 ## Requirements
 
 - Python 3.14+
-- `bot.config.toml` with your Telegram bot token
+- `TELEGRAM_BOT_TOKEN` environment variable
+- `bot.config.toml` with your owner/trusted Telegram user IDs
 - `pi` CLI available on `PATH` (or set `[pi].executable` in config)
 
 ## Setup
@@ -32,9 +33,15 @@ Create a local config file from the example:
 cp bot.config.toml.example bot.config.toml
 ```
 
-Set your Telegram token in `[telegram].bot_token`, your owner user ID in
-`[telegram].bot_owner_user_id`, and optional trusted users in
-`[telegram].trusted_user_ids`. Runtime settings are read from this file.
+Set your Telegram token in an environment variable:
+
+```bash
+export TELEGRAM_BOT_TOKEN="replace-with-telegram-bot-token"
+```
+
+Then set your owner user ID in `[telegram].bot_owner_user_id`, and optional
+trusted users in `[telegram].trusted_user_ids`. Runtime settings are read from
+`bot.config.toml` plus environment variables.
 
 Session behavior is configured under `[pi]`:
 
