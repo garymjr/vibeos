@@ -51,6 +51,7 @@ Set your Discord token in `[discord].bot_token` and your owner user ID in
 Session behavior is configured under `[pi]`:
 
 - `data_dir` sets the working directory (`cwd`) used for all `pi` sessions.
+- When `data_dir` is set, the bot also sets `PI_CODING_AGENT_DIR` to that same path so PI uses isolated settings/extensions/auth instead of your global `~/.pi/agent`.
 - `session_root` stores conversation state on disk.
 - `session_ttl_seconds` controls session lifetime.
 - `session_ttl_seconds = 0` starts a brand-new session for every message.

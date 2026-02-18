@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 import tomllib
@@ -180,6 +181,14 @@ def _load_pi_sdk() -> tuple[Any, type[Exception]]:
     _PI_RPC_CLIENT_CLASS = PiRPCClient
     _PI_RPC_ERROR_CLASS = PiRPCError
     return _PI_RPC_CLIENT_CLASS, _PI_RPC_ERROR_CLASS
+
+
+def _configure_pi_environment(config: BotConfig) -> None:
+    if config.pi_data_dir is None:
+        return
+
+    os.environ["PI_CODING_AGENT_DIR"] = str(config.pi_data_dir)
+    LOGGER.info("Configured PI_CODING_AGENT_DIR=%s", config.pi_data_dir)
 
 
 @dataclass(slots=True)
@@ -533,6 +542,7 @@ def main() -> None:
     config = load_config()
     level = getattr(logging, config.log_level, logging.INFO)
     discord.utils.setup_logging(level=level, root=True)
+    _configure_pi_environment(config)
 
     _add_local_pi_sdk_to_path(config.pi_sdk_path)
     _load_pi_sdk()

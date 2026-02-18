@@ -9,6 +9,7 @@ executable = "pi"
 # provider = "openai"
 # model = "gpt-5"
 # Optional. If set, this directory is used as the working directory (cwd) for all pi sessions.
+# It is also exported as PI_CODING_AGENT_DIR to isolate pi settings/extensions/auth from your global ~/.pi/agent.
 # data_dir = "~/Developer/my-project"
 session_root = ".pi_sessions"
 # 0 means every message starts a fresh pi session.
