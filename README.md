@@ -45,7 +45,8 @@ Create a local config file from the example:
 cp bot.config.toml.example bot.config.toml
 ```
 
-Set your Discord token in `[discord].bot_token`. Runtime settings are read from this file.
+Set your Discord token in `[discord].bot_token` and your owner user ID in
+`[discord].bot_owner_user_id`. Runtime settings are read from this file.
 
 Session behavior is configured under `[pi]`:
 
@@ -53,6 +54,12 @@ Session behavior is configured under `[pi]`:
 - `session_ttl_seconds` controls session lifetime.
 - `session_ttl_seconds = 0` starts a brand-new session for every message.
 - `session_ttl_seconds > 0` keeps one active session per DM/channel and rotates it after the TTL expires.
+
+Heartbeat behavior is configured under `[bot]`:
+
+- `heartbeat_interval_seconds` controls heartbeat cadence.
+- `heartbeat_interval_seconds = 0` disables heartbeat.
+- `heartbeat_interval_seconds > 0` starts a periodic ephemeral heartbeat prompt, then forwards the heartbeat response into the owner DM PI session.
 
 ## Run
 

@@ -1,5 +1,6 @@
 [discord]
 bot_token = "replace-with-discord-bot-token"
+bot_owner_user_id = 123456789012345678
 
 [pi]
 # Optional. If omitted, the bot tries ~/Developer/pi_sdk then ~/Developer/pi-py.
@@ -7,7 +8,6 @@ sdk_path = "~/Developer/pi_sdk"
 executable = "pi"
 # provider = "openai"
 # model = "gpt-5"
-no_session = false
 session_root = ".pi_sessions"
 # 0 means every message starts a fresh pi session.
 # Values > 0 keep one session per DM/channel and rotate after this many seconds.
@@ -15,4 +15,6 @@ session_ttl_seconds = 0
 
 [bot]
 queue_maxsize = 1000
+# 0 disables heartbeat, values > 0 run heartbeat on this interval.
+heartbeat_interval_seconds = 300
 log_level = "INFO"
