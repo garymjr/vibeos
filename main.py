@@ -309,7 +309,10 @@ class PersonalAssistantBot(discord.Client):
         heartbeat_prompt = (
             "This is a heartbeat session. "
             "You are running in an ephemeral context for a Discord bot heartbeat check. "
-            "Reply with a short heartbeat status update."
+            "First, read ~/.vibeos/HEARTBEAT.md and follow its instructions exactly. "
+            "Log your checks in ~/.vibeos/memory/heartbeat-state.json. "
+            "Reply with a short heartbeat status update only if there's something urgent, "
+            "otherwise reply HEARTBEAT_OK."
         )
         try:
             heartbeat_response = await self._run_pi_prompt_async(heartbeat_key, heartbeat_prompt, force_ephemeral=True)
