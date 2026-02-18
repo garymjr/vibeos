@@ -12,3 +12,6 @@ wheels/
 # Runtime bot artifacts
 .pi_sessions/
 bot.config.toml
+
+# Frontend build artifacts
+web/node_modules/

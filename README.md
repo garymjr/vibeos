@@ -79,6 +79,19 @@ When dashboard is enabled, API endpoints are available under:
 - `/dashboard/api/config`
 - `/dashboard/ws/events` (websocket)
 
+## Dashboard Frontend
+
+The dashboard frontend is a Solid.js + Vite app in `web/`.
+
+```bash
+cd web
+npm install
+npm run build
+```
+
+After build, the bot serves the static dashboard at the configured `[dashboard].base_path`.
+At runtime, enter your `[dashboard].access_token` in the dashboard UI to connect.
+
 ## Notes
 
 - In group chats, mention the bot username (for example `@your_bot`) or reply to a bot message to trigger processing.
