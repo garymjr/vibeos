@@ -9,6 +9,9 @@ executable = "pi"
 # model = "gpt-5"
 no_session = false
 session_root = ".pi_sessions"
+# 0 means every message starts a fresh pi session.
+# Values > 0 keep one session per DM/channel and rotate after this many seconds.
+session_ttl_seconds = 0
 
 [bot]
 queue_maxsize = 1000

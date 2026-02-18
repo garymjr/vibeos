@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,15 @@ def _get_positive_int(table: dict[str, object], key: str, *, section: str, defau
     return value
 
 
+def _get_non_negative_int(table: dict[str, object], key: str, *, section: str, default: int) -> int:
+    value = table.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError(f"[{section}] {key} must be a non-negative integer")
+    return value
+
+
 @dataclass(slots=True)
 class BotConfig:
     discord_bot_token: str
@@ -69,6 +79,7 @@ class BotConfig:
     pi_model: str | None
     pi_no_session: bool
     pi_session_root: Path
+    pi_session_ttl_seconds: int
     bot_queue_maxsize: int
     log_level: str
 
@@ -101,6 +112,12 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
     pi_model = _get_optional_string(pi_config, "model", section="pi")
     pi_no_session = _get_bool(pi_config, "no_session", section="pi", default=False)
     pi_session_root = _get_optional_string(pi_config, "session_root", section="pi") or ".pi_sessions"
+    pi_session_ttl_seconds = _get_non_negative_int(
+        pi_config,
+        "session_ttl_seconds",
+        section="pi",
+        default=0,
+    )
     bot_queue_maxsize = _get_positive_int(bot_config, "queue_maxsize", section="bot", default=1000)
     log_level = (_get_optional_string(bot_config, "log_level", section="bot") or "INFO").upper()
 
@@ -112,6 +129,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
         pi_model=pi_model,
         pi_no_session=pi_no_session,
         pi_session_root=Path(pi_session_root).expanduser().resolve(),
+        pi_session_ttl_seconds=pi_session_ttl_seconds,
         bot_queue_maxsize=bot_queue_maxsize,
         log_level=log_level,
     )
@@ -157,6 +175,12 @@ class QueuedMessage:
     content: str
 
 
+@dataclass(slots=True)
+class PiClientState:
+    client: Any
+    created_at_monotonic: float
+
+
 class PersonalAssistantBot(discord.Client):
     def __init__(self, config: BotConfig) -> None:
         intents = discord.Intents.default()
@@ -165,13 +189,14 @@ class PersonalAssistantBot(discord.Client):
 
         self.message_queue: asyncio.Queue[QueuedMessage] = asyncio.Queue(maxsize=config.bot_queue_maxsize)
         self._queue_worker_task: asyncio.Task[None] | None = None
-        self._pi_clients: dict[str, Any] = {}
+        self._pi_clients: dict[str, PiClientState] = {}
 
         self._pi_executable = config.pi_executable
         self._pi_provider = config.pi_provider
         self._pi_model = config.pi_model
         self._pi_no_session = config.pi_no_session
         self._pi_session_root = config.pi_session_root
+        self._pi_session_ttl_seconds = config.pi_session_ttl_seconds
 
     async def on_ready(self) -> None:
         LOGGER.info("Discord bot connected as %s (id=%s)", self.user, self.user.id if self.user else "unknown")
@@ -246,40 +271,72 @@ class PersonalAssistantBot(discord.Client):
             await message.channel.send(chunk)
 
     def _run_pi_prompt(self, conversation_key: str, prompt: str) -> str:
+        if self._pi_session_ttl_seconds == 0:
+            client = self._create_pi_client(conversation_key, force_no_session=True)
+            try:
+                return "".join(client.stream_text(prompt)).strip()
+            finally:
+                self._close_pi_client(conversation_key, client)
+
         client = self._get_pi_client(conversation_key)
         return "".join(client.stream_text(prompt)).strip()
 
     def _get_pi_client(self, conversation_key: str) -> Any:
+        if self._pi_session_ttl_seconds == 0:
+            raise RuntimeError("Session TTL of 0 requires per-message client creation")
+
+        now = time.monotonic()
         pi_rpc_client_class, _ = _load_pi_sdk()
         existing = self._pi_clients.get(conversation_key)
         if existing is not None:
-            return existing
+            age_seconds = now - existing.created_at_monotonic
+            if age_seconds < self._pi_session_ttl_seconds:
+                return existing.client
+            self._close_pi_client(conversation_key, existing.client)
+            del self._pi_clients[conversation_key]
 
-        session_dir = self._pi_session_root / conversation_key
+        client = self._create_pi_client(conversation_key, pi_rpc_client_class=pi_rpc_client_class)
+        self._pi_clients[conversation_key] = PiClientState(client=client, created_at_monotonic=now)
+        return client
+
+    def _create_pi_client(
+        self,
+        conversation_key: str,
+        *,
+        force_no_session: bool = False,
+        pi_rpc_client_class: Any | None = None,
+    ) -> Any:
+        if pi_rpc_client_class is None:
+            pi_rpc_client_class, _ = _load_pi_sdk()
+
+        session_dir = self._pi_session_root / conversation_key / f"session-{time.time_ns()}"
         session_dir.mkdir(parents=True, exist_ok=True)
         client = pi_rpc_client_class(
             executable=self._pi_executable,
             provider=self._pi_provider,
             model=self._pi_model,
-            no_session=self._pi_no_session,
+            no_session=self._pi_no_session or force_no_session,
             session_dir=session_dir,
         )
         client.start()
-        self._pi_clients[conversation_key] = client
         return client
 
     def _close_pi_clients(self) -> None:
-        for key, client in list(self._pi_clients.items()):
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Failed closing pi client for %s", key)
+        for key, state in list(self._pi_clients.items()):
+            self._close_pi_client(key, state.client)
         self._pi_clients.clear()
+
+    @staticmethod
+    def _close_pi_client(conversation_key: str, client: Any) -> None:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed closing pi client for %s", conversation_key)
 
     @staticmethod
     def _conversation_key(message: discord.Message) -> str:
         if message.guild is None:
-            return f"dm-{message.channel.id}"
+            return f"dm-user-{message.author.id}-channel-{message.channel.id}"
         return f"guild-{message.guild.id}-channel-{message.channel.id}"
 
     @staticmethod

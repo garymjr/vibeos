@@ -47,6 +47,13 @@ cp bot.config.toml.example bot.config.toml
 
 Set your Discord token in `[discord].bot_token`. Runtime settings are read from this file.
 
+Session behavior is configured under `[pi]`:
+
+- `session_root` stores conversation state on disk.
+- `session_ttl_seconds` controls session lifetime.
+- `session_ttl_seconds = 0` starts a brand-new session for every message.
+- `session_ttl_seconds > 0` keeps one active session per DM/channel and rotates it after the TTL expires.
+
 ## Run
 
 ```bash
