@@ -2,18 +2,122 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import discord
 
 LOGGER = logging.getLogger("assistant.bot")
+DEFAULT_CONFIG_PATH = Path("bot.config.toml")
+
+_PI_RPC_CLIENT_CLASS: Any | None = None
+_PI_RPC_ERROR_CLASS: type[Exception] = Exception
 
 
-def _add_local_pi_sdk_to_path() -> None:
-    configured = os.getenv("PI_SDK_PATH")
+def _as_table(value: object, *, name: str) -> dict[str, object]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise RuntimeError(f"[{name}] must be a TOML table")
+    return value
+
+
+def _get_required_string(table: dict[str, object], key: str, *, section: str) -> str:
+    value = table.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"[{section}] {key} must be a non-empty string")
+    return value.strip()
+
+
+def _get_optional_string(table: dict[str, object], key: str, *, section: str) -> str | None:
+    value = table.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError(f"[{section}] {key} must be a string when set")
+    stripped = value.strip()
+    return stripped or None
+
+
+def _get_bool(table: dict[str, object], key: str, *, section: str, default: bool) -> bool:
+    value = table.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise RuntimeError(f"[{section}] {key} must be a boolean")
+    return value
+
+
+def _get_positive_int(table: dict[str, object], key: str, *, section: str, default: int) -> int:
+    value = table.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise RuntimeError(f"[{section}] {key} must be a positive integer")
+    return value
+
+
+@dataclass(slots=True)
+class BotConfig:
+    discord_bot_token: str
+    pi_sdk_path: str | None
+    pi_executable: str
+    pi_provider: str | None
+    pi_model: str | None
+    pi_no_session: bool
+    pi_session_root: Path
+    bot_queue_maxsize: int
+    log_level: str
+
+
+def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
+    resolved_path = path.expanduser().resolve()
+    if not resolved_path.exists():
+        raise RuntimeError(
+            f"Config file not found at {resolved_path}. "
+            "Create bot.config.toml from bot.config.toml.example."
+        )
+
+    with resolved_path.open("rb") as handle:
+        config_data = tomllib.load(handle)
+
+    if not isinstance(config_data, dict):
+        raise RuntimeError("Config root must be a TOML table")
+
+    discord_config = _as_table(config_data.get("discord"), name="discord")
+    if not discord_config:
+        raise RuntimeError("Missing required [discord] section in bot.config.toml")
+
+    pi_config = _as_table(config_data.get("pi"), name="pi")
+    bot_config = _as_table(config_data.get("bot"), name="bot")
+
+    token = _get_required_string(discord_config, "bot_token", section="discord")
+    pi_sdk_path = _get_optional_string(pi_config, "sdk_path", section="pi")
+    pi_executable = _get_optional_string(pi_config, "executable", section="pi") or "pi"
+    pi_provider = _get_optional_string(pi_config, "provider", section="pi")
+    pi_model = _get_optional_string(pi_config, "model", section="pi")
+    pi_no_session = _get_bool(pi_config, "no_session", section="pi", default=False)
+    pi_session_root = _get_optional_string(pi_config, "session_root", section="pi") or ".pi_sessions"
+    bot_queue_maxsize = _get_positive_int(bot_config, "queue_maxsize", section="bot", default=1000)
+    log_level = (_get_optional_string(bot_config, "log_level", section="bot") or "INFO").upper()
+
+    return BotConfig(
+        discord_bot_token=token,
+        pi_sdk_path=pi_sdk_path,
+        pi_executable=pi_executable,
+        pi_provider=pi_provider,
+        pi_model=pi_model,
+        pi_no_session=pi_no_session,
+        pi_session_root=Path(pi_session_root).expanduser().resolve(),
+        bot_queue_maxsize=bot_queue_maxsize,
+        log_level=log_level,
+    )
+
+
+def _add_local_pi_sdk_to_path(configured: str | None) -> None:
     candidates = [configured] if configured else []
     candidates.extend(["~/Developer/pi_sdk", "~/Developer/pi-py"])
 
@@ -29,16 +133,22 @@ def _add_local_pi_sdk_to_path() -> None:
         break
 
 
-_add_local_pi_sdk_to_path()
+def _load_pi_sdk() -> tuple[Any, type[Exception]]:
+    global _PI_RPC_CLIENT_CLASS, _PI_RPC_ERROR_CLASS
+    if _PI_RPC_CLIENT_CLASS is not None:
+        return _PI_RPC_CLIENT_CLASS, _PI_RPC_ERROR_CLASS
 
-from pi_sdk import PiRPCClient, PiRPCError  # noqa: E402
+    try:
+        from pi_sdk import PiRPCClient, PiRPCError
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Failed to import pi_sdk. "
+            "Check [pi].sdk_path or install pi_sdk in the active Python environment."
+        ) from exc
 
-
-def _env_flag(name: str, *, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    _PI_RPC_CLIENT_CLASS = PiRPCClient
+    _PI_RPC_ERROR_CLASS = PiRPCError
+    return _PI_RPC_CLIENT_CLASS, _PI_RPC_ERROR_CLASS
 
 
 @dataclass(slots=True)
@@ -48,22 +158,20 @@ class QueuedMessage:
 
 
 class PersonalAssistantBot(discord.Client):
-    def __init__(self) -> None:
+    def __init__(self, config: BotConfig) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
 
-        self.message_queue: asyncio.Queue[QueuedMessage] = asyncio.Queue(
-            maxsize=int(os.getenv("BOT_QUEUE_MAXSIZE", "1000"))
-        )
+        self.message_queue: asyncio.Queue[QueuedMessage] = asyncio.Queue(maxsize=config.bot_queue_maxsize)
         self._queue_worker_task: asyncio.Task[None] | None = None
-        self._pi_clients: dict[str, PiRPCClient] = {}
+        self._pi_clients: dict[str, Any] = {}
 
-        self._pi_executable = os.getenv("PI_EXECUTABLE", "pi")
-        self._pi_provider = os.getenv("PI_PROVIDER")
-        self._pi_model = os.getenv("PI_MODEL")
-        self._pi_no_session = _env_flag("PI_NO_SESSION", default=False)
-        self._pi_session_root = Path(os.getenv("PI_SESSION_ROOT", ".pi_sessions")).resolve()
+        self._pi_executable = config.pi_executable
+        self._pi_provider = config.pi_provider
+        self._pi_model = config.pi_model
+        self._pi_no_session = config.pi_no_session
+        self._pi_session_root = config.pi_session_root
 
     async def on_ready(self) -> None:
         LOGGER.info("Discord bot connected as %s (id=%s)", self.user, self.user.id if self.user else "unknown")
@@ -120,12 +228,13 @@ class PersonalAssistantBot(discord.Client):
         message = queued.message
         conversation_key = self._conversation_key(message)
         prompt = self._prompt_from_message(queued)
+        _, pi_error_type = _load_pi_sdk()
 
         LOGGER.info("Processing queued message %s for %s", message.id, conversation_key)
         try:
             async with message.channel.typing():
                 response_text = await asyncio.to_thread(self._run_pi_prompt, conversation_key, prompt)
-        except PiRPCError as exc:
+        except pi_error_type as exc:
             LOGGER.exception("pi_sdk error for message %s: %s", message.id, exc)
             await message.channel.send(f"pi error: {exc}")
             return
@@ -140,14 +249,15 @@ class PersonalAssistantBot(discord.Client):
         client = self._get_pi_client(conversation_key)
         return "".join(client.stream_text(prompt)).strip()
 
-    def _get_pi_client(self, conversation_key: str) -> PiRPCClient:
+    def _get_pi_client(self, conversation_key: str) -> Any:
+        pi_rpc_client_class, _ = _load_pi_sdk()
         existing = self._pi_clients.get(conversation_key)
         if existing is not None:
             return existing
 
         session_dir = self._pi_session_root / conversation_key
         session_dir.mkdir(parents=True, exist_ok=True)
-        client = PiRPCClient(
+        client = pi_rpc_client_class(
             executable=self._pi_executable,
             provider=self._pi_provider,
             model=self._pi_model,
@@ -214,15 +324,15 @@ class PersonalAssistantBot(discord.Client):
 
 
 def main() -> None:
-    level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    config = load_config()
+    level = getattr(logging, config.log_level, logging.INFO)
     discord.utils.setup_logging(level=level, root=True)
 
-    token = os.getenv("DISCORD_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("DISCORD_BOT_TOKEN is required")
+    _add_local_pi_sdk_to_path(config.pi_sdk_path)
+    _load_pi_sdk()
 
-    bot = PersonalAssistantBot()
-    bot.run(token, log_handler=None)
+    bot = PersonalAssistantBot(config)
+    bot.run(config.discord_bot_token, log_handler=None)
 
 
 if __name__ == "__main__":

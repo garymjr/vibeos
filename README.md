@@ -12,12 +12,12 @@ Discord bot using `discord.py` with a message queue and `pi_sdk` backend.
 ## Requirements
 
 - Python 3
-- Discord bot token
+- `bot.config.toml` with your Discord bot token
 - Local `pi_sdk` source directory (default lookup order):
-  - `PI_SDK_PATH` env var (if set)
+  - `[pi].sdk_path` in `bot.config.toml` (if set)
   - `~/Developer/pi_sdk`
   - `~/Developer/pi-py` (fallback)
-- `pi` CLI available on `PATH` (or set `PI_EXECUTABLE`)
+- `pi` CLI available on `PATH` (or set `[pi].executable` in config)
 
 ## Setup
 
@@ -37,22 +37,20 @@ Or, for the fallback path used in this workspace:
 python3 -m pip install -e ~/Developer/pi-py
 ```
 
-## Environment Variables
+## Configuration
 
-- `DISCORD_BOT_TOKEN` (required)
-- `PI_SDK_PATH` (optional, local sdk path)
-- `PI_EXECUTABLE` (default: `pi`)
-- `PI_PROVIDER` (optional)
-- `PI_MODEL` (optional)
-- `PI_NO_SESSION` (optional, default: `false`)
-- `PI_SESSION_ROOT` (optional, default: `.pi_sessions`)
-- `BOT_QUEUE_MAXSIZE` (optional, default: `1000`)
-- `LOG_LEVEL` (optional, default: `INFO`)
+Create a local config file from the example:
+
+```bash
+cp bot.config.toml.example bot.config.toml
+```
+
+Set your Discord token in `[discord].bot_token`. Runtime settings are read from this file.
 
 ## Run
 
 ```bash
-DISCORD_BOT_TOKEN=... python3 main.py
+python3 main.py
 ```
 
 ## Notes

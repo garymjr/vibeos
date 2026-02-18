@@ -1,0 +1,15 @@
+[discord]
+bot_token = "replace-with-discord-bot-token"
+
+[pi]
+# Optional. If omitted, the bot tries ~/Developer/pi_sdk then ~/Developer/pi-py.
+sdk_path = "~/Developer/pi_sdk"
+executable = "pi"
+# provider = "openai"
+# model = "gpt-5"
+no_session = false
+session_root = ".pi_sessions"
+
+[bot]
+queue_maxsize = 1000
+log_level = "INFO"

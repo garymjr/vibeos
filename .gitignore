@@ -11,3 +11,4 @@ wheels/
 
 # Runtime bot artifacts
 .pi_sessions/
+bot.config.toml
