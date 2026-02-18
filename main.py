@@ -1165,6 +1165,17 @@ class PersonalAssistantBot:
         return chunks
 
 
+def _ensure_event_loop() -> None:
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        return
+
+    if loop.is_closed():
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 def main() -> None:
     config = load_config()
     level = getattr(logging, config.log_level, logging.INFO)
@@ -1190,6 +1201,7 @@ def main() -> None:
     )
     application.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, bot.on_message))
     application.add_error_handler(bot.on_error)
+    _ensure_event_loop()
     application.run_polling()
 
 
