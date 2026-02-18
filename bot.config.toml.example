@@ -1,8 +1,8 @@
-[discord]
-bot_token = "replace-with-discord-bot-token"
-bot_owner_user_id = 123456789012345678
+[telegram]
+bot_token = "replace-with-telegram-bot-token"
+bot_owner_user_id = 123456789
 # Optional additional users the bot will accept messages from.
-# In channels, these users must still mention the bot.
+# In non-DM chats, these users must still mention the bot (or reply to one of its messages).
 trusted_user_ids = []
 
 [pi]
@@ -14,7 +14,7 @@ executable = "pi"
 # data_dir = "~/Developer/my-project"
 session_root = ".pi_sessions"
 # 0 means every message starts a fresh pi session (except forced owner/session flows).
-# Values > 0 keep one session per DM/channel and rotate after this many seconds of inactivity.
+# Values > 0 keep one session per DM/chat and rotate after this many seconds of inactivity.
 session_ttl_seconds = 0
 # 0 disables the timeout. Values > 0 fail calls that exceed the limit.
 call_timeout_seconds = 180

@@ -1,21 +1,21 @@
-# Discord Personal Assistant Bot
+# Telegram Personal Assistant Bot
 
-Discord bot using `discord.py` with a bounded concurrent queue worker pool and `pi_sdk` backend.
+Telegram bot using `python-telegram-bot` with a bounded concurrent queue worker pool and `pi_sdk` backend.
 
 ## Behavior
 
-- Accepts messages only from the bot owner and IDs in `[discord].trusted_user_ids`.
-- In guild channels, the message must mention the bot.
+- Accepts messages only from the bot owner and IDs in `[telegram].trusted_user_ids`.
+- In group chats, the message must mention the bot (or reply to one of its messages).
 - In DMs, mention is not required.
 - Pushes each message into an in-memory queue.
 - Multiple workers process queued messages concurrently.
-- Per-conversation locks preserve message ordering within each DM/channel.
-- Streams response deltas into an in-channel progress message before posting the final response.
+- Per-conversation locks preserve message ordering within each DM/chat.
+- Streams response deltas into a progress message before posting the final response.
 
 ## Requirements
 
-- Python 3
-- `bot.config.toml` with your Discord bot token
+- Python 3.14+
+- `bot.config.toml` with your Telegram bot token
 - `pi` CLI available on `PATH` (or set `[pi].executable` in config)
 
 ## Setup
@@ -32,9 +32,9 @@ Create a local config file from the example:
 cp bot.config.toml.example bot.config.toml
 ```
 
-Set your Discord token in `[discord].bot_token`, your owner user ID in
-`[discord].bot_owner_user_id`, and optional trusted users in
-`[discord].trusted_user_ids`. Runtime settings are read from this file.
+Set your Telegram token in `[telegram].bot_token`, your owner user ID in
+`[telegram].bot_owner_user_id`, and optional trusted users in
+`[telegram].trusted_user_ids`. Runtime settings are read from this file.
 
 Session behavior is configured under `[pi]`:
 
@@ -43,7 +43,7 @@ Session behavior is configured under `[pi]`:
 - `session_root` stores conversation state on disk.
 - `session_ttl_seconds` controls session lifetime.
 - `session_ttl_seconds = 0` starts a brand-new session for every message (except forced session paths).
-- `session_ttl_seconds > 0` keeps one active session per DM/channel and expires idle sessions after the TTL.
+- `session_ttl_seconds > 0` keeps one active session per DM/chat and expires idle sessions after the TTL.
 - `call_timeout_seconds` enforces a hard timeout around PI calls (`0` disables timeout).
 - `session_sweeper_interval_seconds` controls periodic cleanup of stale in-memory clients and stale on-disk session directories (`0` disables sweeper).
 
@@ -64,5 +64,5 @@ uv run python3 main.py
 
 ## Notes
 
-- Enable the Message Content Intent for your bot in the Discord Developer Portal.
+- In group chats, mention the bot username (for example `@your_bot`) or reply to a bot message to trigger processing.
 - Health logs report queue depth, oldest queue age, active session count, timeout count, and per-conversation latency percentiles.
