@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sys
 import time
 import tomllib
 from dataclasses import dataclass
@@ -73,7 +72,6 @@ def _get_non_negative_int(table: dict[str, object], key: str, *, section: str, d
 class BotConfig:
     discord_bot_token: str
     discord_bot_owner_user_id: int
-    pi_sdk_path: str | None
     pi_executable: str
     pi_provider: str | None
     pi_model: str | None
@@ -108,7 +106,6 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
 
     token = _get_required_string(discord_config, "bot_token", section="discord")
     owner_user_id = _get_required_positive_int(discord_config, "bot_owner_user_id", section="discord")
-    pi_sdk_path = _get_optional_string(pi_config, "sdk_path", section="pi")
     pi_executable = _get_optional_string(pi_config, "executable", section="pi") or "pi"
     pi_provider = _get_optional_string(pi_config, "provider", section="pi")
     pi_model = _get_optional_string(pi_config, "model", section="pi")
@@ -136,7 +133,6 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
     return BotConfig(
         discord_bot_token=token,
         discord_bot_owner_user_id=owner_user_id,
-        pi_sdk_path=pi_sdk_path,
         pi_executable=pi_executable,
         pi_provider=pi_provider,
         pi_model=pi_model,
@@ -149,22 +145,6 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
     )
 
 
-def _add_local_pi_sdk_to_path(configured: str | None) -> None:
-    candidates = [configured] if configured else []
-    candidates.extend(["~/Developer/pi_sdk", "~/Developer/pi-py"])
-
-    for candidate in candidates:
-        if not candidate:
-            continue
-        expanded = Path(candidate).expanduser().resolve()
-        if not expanded.exists():
-            continue
-        path_str = str(expanded)
-        if path_str not in sys.path:
-            sys.path.insert(0, path_str)
-        break
-
-
 def _load_pi_sdk() -> tuple[Any, type[Exception]]:
     global _PI_RPC_CLIENT_CLASS, _PI_RPC_ERROR_CLASS
     if _PI_RPC_CLIENT_CLASS is not None:
@@ -175,7 +155,7 @@ def _load_pi_sdk() -> tuple[Any, type[Exception]]:
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
             "Failed to import pi_sdk. "
-            "Check [pi].sdk_path or install pi_sdk in the active Python environment."
+            "Install pi_sdk in the active Python environment."
         ) from exc
 
     _PI_RPC_CLIENT_CLASS = PiRPCClient
@@ -456,7 +436,7 @@ class PersonalAssistantBot(discord.Client):
             if self._pi_data_dir is not None and "cwd" in str(exc):
                 raise RuntimeError(
                     "Configured [pi] data_dir requires pi_sdk with PiRPCClient(cwd=...). "
-                    "Update your local pi_sdk installation."
+                    "Update your pi_sdk installation."
                 ) from exc
             raise
         client.start()
@@ -544,7 +524,6 @@ def main() -> None:
     discord.utils.setup_logging(level=level, root=True)
     _configure_pi_environment(config)
 
-    _add_local_pi_sdk_to_path(config.pi_sdk_path)
     _load_pi_sdk()
 
     bot = PersonalAssistantBot(config)

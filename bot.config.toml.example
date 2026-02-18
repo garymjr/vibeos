@@ -3,8 +3,6 @@ bot_token = "replace-with-discord-bot-token"
 bot_owner_user_id = 123456789012345678
 
 [pi]
-# Optional. If omitted, the bot tries ~/Developer/pi_sdk then ~/Developer/pi-py.
-sdk_path = "~/Developer/pi_sdk"
 executable = "pi"
 # provider = "openai"
 # model = "gpt-5"

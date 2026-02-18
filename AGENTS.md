@@ -14,9 +14,8 @@ Keep new code close to the current layout unless a clear module split is needed.
 ## Build, Test, and Development Commands
 Use `uv` for dependency management and command execution.
 
-- `uv sync`: create/update the project environment from `pyproject.toml` and `uv.lock`.
+- `uv sync`: create/update the project environment from `pyproject.toml` and `uv.lock` (includes `pi_sdk` from GitHub).
 - `cp bot.config.toml.example bot.config.toml`: create local config.
-- `uv pip install -e ~/Developer/pi_sdk` (or `~/Developer/pi-py`): install local SDK dependency.
 - `uv run python3 main.py`: run the bot.
 - `uv run python3 -m py_compile main.py`: quick syntax check before opening a PR.
 

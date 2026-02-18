@@ -13,28 +13,12 @@ Discord bot using `discord.py` with a message queue and `pi_sdk` backend.
 
 - Python 3
 - `bot.config.toml` with your Discord bot token
-- Local `pi_sdk` source directory (default lookup order):
-  - `[pi].sdk_path` in `bot.config.toml` (if set)
-  - `~/Developer/pi_sdk`
-  - `~/Developer/pi-py` (fallback)
 - `pi` CLI available on `PATH` (or set `[pi].executable` in config)
 
 ## Setup
 
 ```bash
-python3 -m pip install -e .
-```
-
-If needed, install local SDK in editable mode too:
-
-```bash
-python3 -m pip install -e ~/Developer/pi_sdk
-```
-
-Or, for the fallback path used in this workspace:
-
-```bash
-python3 -m pip install -e ~/Developer/pi-py
+uv sync
 ```
 
 ## Configuration
@@ -66,7 +50,7 @@ Heartbeat behavior is configured under `[bot]`:
 ## Run
 
 ```bash
-python3 main.py
+uv run python3 main.py
 ```
 
 ## Notes
