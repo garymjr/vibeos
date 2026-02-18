@@ -68,10 +68,27 @@ def _get_non_negative_int(table: dict[str, object], key: str, *, section: str, d
     return value
 
 
+def _get_positive_int_list(table: dict[str, object], key: str, *, section: str) -> list[int]:
+    value = table.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RuntimeError(f"[{section}] {key} must be a list of positive integers when set")
+
+    values: list[int] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
+            raise RuntimeError(f"[{section}] {key}[{index}] must be a positive integer")
+        values.append(item)
+
+    return list(dict.fromkeys(values))
+
+
 @dataclass(slots=True)
 class BotConfig:
     discord_bot_token: str
     discord_bot_owner_user_id: int
+    discord_trusted_user_ids: tuple[int, ...]
     pi_executable: str
     pi_provider: str | None
     pi_model: str | None
@@ -106,6 +123,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
 
     token = _get_required_string(discord_config, "bot_token", section="discord")
     owner_user_id = _get_required_positive_int(discord_config, "bot_owner_user_id", section="discord")
+    trusted_user_ids = _get_positive_int_list(discord_config, "trusted_user_ids", section="discord")
     pi_executable = _get_optional_string(pi_config, "executable", section="pi") or "pi"
     pi_provider = _get_optional_string(pi_config, "provider", section="pi")
     pi_model = _get_optional_string(pi_config, "model", section="pi")
@@ -133,6 +151,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
     return BotConfig(
         discord_bot_token=token,
         discord_bot_owner_user_id=owner_user_id,
+        discord_trusted_user_ids=tuple(trusted_user_ids),
         pi_executable=pi_executable,
         pi_provider=pi_provider,
         pi_model=pi_model,
@@ -196,6 +215,7 @@ class PersonalAssistantBot(discord.Client):
         self._pi_lock = asyncio.Lock()
 
         self._bot_owner_user_id = config.discord_bot_owner_user_id
+        self._trusted_user_ids = set(config.discord_trusted_user_ids)
         self._pi_executable = config.pi_executable
         self._pi_provider = config.pi_provider
         self._pi_model = config.pi_model
@@ -218,6 +238,10 @@ class PersonalAssistantBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.is_system():
             return
+        if not self._is_authorized_user(message.author.id):
+            return
+        if message.guild is not None and not self._is_bot_mentioned(message):
+            return
 
         text = message.content.strip()
         if not text:
@@ -232,6 +256,13 @@ class PersonalAssistantBot(discord.Client):
             message.channel.id,
             self.message_queue.qsize(),
         )
+
+    def _is_authorized_user(self, user_id: int) -> bool:
+        return user_id == self._bot_owner_user_id or user_id in self._trusted_user_ids
+
+    def _is_bot_mentioned(self, message: discord.Message) -> bool:
+        current_user = self.user
+        return current_user is not None and current_user.id in message.raw_mentions
 
     async def close(self) -> None:
         if self._heartbeat_task is not None:
@@ -525,6 +556,9 @@ def main() -> None:
     config = load_config()
     level = getattr(logging, config.log_level, logging.INFO)
     discord.utils.setup_logging(level=level, root=True)
+    provider = config.pi_provider or "<default>"
+    model = config.pi_model or "<default>"
+    LOGGER.info("Starting bot with pi provider=%s model=%s", provider, model)
     _configure_pi_environment(config)
 
     _load_pi_sdk()

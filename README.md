@@ -4,7 +4,9 @@ Discord bot using `discord.py` with a message queue and `pi_sdk` backend.
 
 ## Behavior
 
-- Listens for incoming Discord messages (guild channels and DMs).
+- Accepts messages only from the bot owner and IDs in `[discord].trusted_user_ids`.
+- In guild channels, the message must mention the bot.
+- In DMs, mention is not required.
 - Pushes each message into an in-memory queue.
 - A queue worker reads messages one at a time and sends prompts to `pi` via `pi_sdk`.
 - Sends the `pi` response back to the same channel or DM where the message originated.
@@ -29,8 +31,9 @@ Create a local config file from the example:
 cp bot.config.toml.example bot.config.toml
 ```
 
-Set your Discord token in `[discord].bot_token` and your owner user ID in
-`[discord].bot_owner_user_id`. Runtime settings are read from this file.
+Set your Discord token in `[discord].bot_token`, your owner user ID in
+`[discord].bot_owner_user_id`, and optional trusted users in
+`[discord].trusted_user_ids`. Runtime settings are read from this file.
 
 Session behavior is configured under `[pi]`:
 
