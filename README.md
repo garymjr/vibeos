@@ -1,6 +1,6 @@
 # Discord Personal Assistant Bot
 
-Discord bot using `discord.py` with a message queue and `pi_sdk` backend.
+Discord bot using `discord.py` with a bounded concurrent queue worker pool and `pi_sdk` backend.
 
 ## Behavior
 
@@ -8,8 +8,9 @@ Discord bot using `discord.py` with a message queue and `pi_sdk` backend.
 - In guild channels, the message must mention the bot.
 - In DMs, mention is not required.
 - Pushes each message into an in-memory queue.
-- A queue worker reads messages one at a time and sends prompts to `pi` via `pi_sdk`.
-- Sends the `pi` response back to the same channel or DM where the message originated.
+- Multiple workers process queued messages concurrently.
+- Per-conversation locks preserve message ordering within each DM/channel.
+- Streams response deltas into an in-channel progress message before posting the final response.
 
 ## Requirements
 
@@ -41,14 +42,19 @@ Session behavior is configured under `[pi]`:
 - When `data_dir` is set, the bot also sets `PI_CODING_AGENT_DIR` to that same path so PI uses isolated settings/extensions/auth instead of your global `~/.pi/agent`.
 - `session_root` stores conversation state on disk.
 - `session_ttl_seconds` controls session lifetime.
-- `session_ttl_seconds = 0` starts a brand-new session for every message.
-- `session_ttl_seconds > 0` keeps one active session per DM/channel and rotates it after the TTL expires.
+- `session_ttl_seconds = 0` starts a brand-new session for every message (except forced session paths).
+- `session_ttl_seconds > 0` keeps one active session per DM/channel and expires idle sessions after the TTL.
+- `call_timeout_seconds` enforces a hard timeout around PI calls (`0` disables timeout).
+- `session_sweeper_interval_seconds` controls periodic cleanup of stale in-memory clients and stale on-disk session directories (`0` disables sweeper).
 
-Heartbeat behavior is configured under `[bot]`:
+Bot runtime behavior is configured under `[bot]`:
 
-- `heartbeat_interval_seconds` controls heartbeat cadence.
-- `heartbeat_interval_seconds = 0` disables heartbeat.
-- `heartbeat_interval_seconds > 0` starts a periodic ephemeral heartbeat prompt, then forwards the heartbeat response into the owner DM PI session.
+- `queue_maxsize` sets max pending inbound messages.
+- `worker_concurrency` controls queue worker pool size.
+- `heartbeat_interval_seconds` controls heartbeat cadence (`0` disables heartbeat).
+- `metrics_interval_seconds` controls periodic health telemetry logs (`0` disables this worker).
+- `stream_edit_interval_ms` throttles how frequently progress message edits are sent.
+- `latency_window_size` sets the sample window used for per-conversation latency percentiles.
 
 ## Run
 
@@ -59,4 +65,4 @@ uv run python3 main.py
 ## Notes
 
 - Enable the Message Content Intent for your bot in the Discord Developer Portal.
-- The queue worker processes messages sequentially so responses are generated in order.
+- Health logs report queue depth, oldest queue age, active session count, timeout count, and per-conversation latency percentiles.
