@@ -184,16 +184,22 @@ class DashboardServer:
             return self._frontend_not_built_response()
         return web.FileResponse(index_file)
 
+    def _resolve_frontend_path(self, *parts: str) -> Path | None:
+        dist_root = self._frontend_dist.resolve()
+        candidate = (dist_root.joinpath(*parts)).resolve()
+        try:
+            candidate.relative_to(dist_root)
+        except ValueError:
+            return None
+        return candidate
+
     async def _handle_static_or_dashboard(self, request: web.Request) -> web.StreamResponse:
         tail = request.match_info.get("tail", "")
         if not tail:
             return await self._handle_dashboard(request)
 
-        dist_root = self._frontend_dist.resolve()
-        candidate = (dist_root / tail).resolve()
-        try:
-            candidate.relative_to(dist_root)
-        except ValueError:
+        candidate = self._resolve_frontend_path(tail)
+        if candidate is None:
             raise web.HTTPNotFound from None
 
         if candidate.is_file():
@@ -202,11 +208,8 @@ class DashboardServer:
 
     async def _handle_root_assets(self, request: web.Request) -> web.StreamResponse:
         asset_tail = request.match_info.get("tail", "")
-        asset_path = (self._frontend_dist / "assets" / asset_tail).resolve()
-        dist_root = self._frontend_dist.resolve()
-        try:
-            asset_path.relative_to(dist_root)
-        except ValueError:
+        asset_path = self._resolve_frontend_path("assets", asset_tail)
+        if asset_path is None:
             raise web.HTTPNotFound from None
 
         if asset_path.is_file():

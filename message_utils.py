@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 from telegram import Message, MessageEntity
 
+TELEGRAM_MESSAGE_LIMIT = 4096
+
 
 @dataclass(slots=True)
 class QueuedMessage:
@@ -79,7 +81,7 @@ def prompt_from_message(queued: QueuedMessage) -> str:
     )
 
 
-def stream_preview(text: str, *, limit: int = 4096) -> str:
+def stream_preview(text: str, *, limit: int = TELEGRAM_MESSAGE_LIMIT) -> str:
     if not text:
         return "Thinking..."
     if len(text) <= limit:
@@ -90,7 +92,7 @@ def stream_preview(text: str, *, limit: int = 4096) -> str:
     return header + text[-tail_size:]
 
 
-def split_for_telegram(text: str, *, limit: int = 4096) -> list[str]:
+def split_for_telegram(text: str, *, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     if len(text) <= limit:
         return [text]
 
