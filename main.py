@@ -76,6 +76,7 @@ class BotConfig:
     pi_executable: str
     pi_provider: str | None
     pi_model: str | None
+    pi_data_dir: Path | None
     pi_session_root: Path
     pi_session_ttl_seconds: int
     bot_queue_maxsize: int
@@ -110,6 +111,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
     pi_executable = _get_optional_string(pi_config, "executable", section="pi") or "pi"
     pi_provider = _get_optional_string(pi_config, "provider", section="pi")
     pi_model = _get_optional_string(pi_config, "model", section="pi")
+    pi_data_dir_raw = _get_optional_string(pi_config, "data_dir", section="pi")
     pi_session_root = _get_optional_string(pi_config, "session_root", section="pi") or ".pi_sessions"
     pi_session_ttl_seconds = _get_non_negative_int(
         pi_config,
@@ -126,6 +128,10 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
     )
     log_level = (_get_optional_string(bot_config, "log_level", section="bot") or "INFO").upper()
 
+    pi_data_dir = Path(pi_data_dir_raw).expanduser().resolve() if pi_data_dir_raw else None
+    if pi_data_dir is not None:
+        pi_data_dir.mkdir(parents=True, exist_ok=True)
+
     return BotConfig(
         discord_bot_token=token,
         discord_bot_owner_user_id=owner_user_id,
@@ -133,6 +139,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
         pi_executable=pi_executable,
         pi_provider=pi_provider,
         pi_model=pi_model,
+        pi_data_dir=pi_data_dir,
         pi_session_root=Path(pi_session_root).expanduser().resolve(),
         pi_session_ttl_seconds=pi_session_ttl_seconds,
         bot_queue_maxsize=bot_queue_maxsize,
@@ -203,6 +210,7 @@ class PersonalAssistantBot(discord.Client):
         self._pi_executable = config.pi_executable
         self._pi_provider = config.pi_provider
         self._pi_model = config.pi_model
+        self._pi_data_dir = config.pi_data_dir
         self._pi_session_root = config.pi_session_root
         self._pi_session_ttl_seconds = config.pi_session_ttl_seconds
         self._heartbeat_interval_seconds = config.bot_heartbeat_interval_seconds
@@ -429,15 +437,33 @@ class PersonalAssistantBot(discord.Client):
         session_dir = self._pi_session_root / conversation_key / f"session-{time.time_ns()}"
         session_dir.mkdir(parents=True, exist_ok=True)
         LOGGER.info("Starting pi session for %s", conversation_key)
-        client = pi_rpc_client_class(
-            executable=self._pi_executable,
-            provider=self._pi_provider,
-            model=self._pi_model,
-            no_session=force_no_session,
+        kwargs = self._build_pi_client_kwargs(
+            force_no_session=force_no_session,
             session_dir=session_dir,
         )
+        try:
+            client = pi_rpc_client_class(**kwargs)
+        except TypeError as exc:
+            if self._pi_data_dir is not None and "cwd" in str(exc):
+                raise RuntimeError(
+                    "Configured [pi] data_dir requires pi_sdk with PiRPCClient(cwd=...). "
+                    "Update your local pi_sdk installation."
+                ) from exc
+            raise
         client.start()
         return client
+
+    def _build_pi_client_kwargs(self, *, force_no_session: bool, session_dir: Path) -> dict[str, object]:
+        kwargs: dict[str, object] = {
+            "executable": self._pi_executable,
+            "provider": self._pi_provider,
+            "model": self._pi_model,
+            "no_session": force_no_session,
+            "session_dir": session_dir,
+        }
+        if self._pi_data_dir is not None:
+            kwargs["cwd"] = self._pi_data_dir
+        return kwargs
 
     def _close_pi_clients(self) -> None:
         for key, state in list(self._pi_clients.items()):

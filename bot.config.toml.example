@@ -8,6 +8,8 @@ sdk_path = "~/Developer/pi_sdk"
 executable = "pi"
 # provider = "openai"
 # model = "gpt-5"
+# Optional. If set, this directory is used as the working directory (cwd) for all pi sessions.
+# data_dir = "~/Developer/my-project"
 session_root = ".pi_sessions"
 # 0 means every message starts a fresh pi session.
 # Values > 0 keep one session per DM/channel and rotate after this many seconds.

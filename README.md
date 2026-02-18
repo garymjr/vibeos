@@ -50,6 +50,7 @@ Set your Discord token in `[discord].bot_token` and your owner user ID in
 
 Session behavior is configured under `[pi]`:
 
+- `data_dir` sets the working directory (`cwd`) used for all `pi` sessions.
 - `session_root` stores conversation state on disk.
 - `session_ttl_seconds` controls session lifetime.
 - `session_ttl_seconds = 0` starts a brand-new session for every message.
