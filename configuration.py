@@ -45,6 +45,12 @@ class BotConfig:
     bot_metrics_interval_seconds: int
     bot_stream_edit_interval_ms: int
     bot_latency_window_size: int
+    dashboard_enabled: bool
+    dashboard_host: str
+    dashboard_port: int
+    dashboard_base_path: str
+    dashboard_access_token: str | None
+    dashboard_ws_push_interval_ms: int
     log_level: str
 
 
@@ -90,6 +96,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
 
     pi_config = _as_table(config_data.get("pi"), name="pi")
     bot_config = _as_table(config_data.get("bot"), name="bot")
+    dashboard_config = _as_table(config_data.get("dashboard"), name="dashboard")
 
     token = _get_required_string(telegram_config, "bot_token", section="telegram")
     owner_user_id = _get_required_positive_int(telegram_config, "bot_owner_user_id", section="telegram")
@@ -145,6 +152,28 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
         section="bot",
         default=200,
     )
+    dashboard_enabled = _get_bool(dashboard_config, "enabled", section="dashboard", default=False)
+    dashboard_host = _get_optional_string(dashboard_config, "host", section="dashboard") or "127.0.0.1"
+    dashboard_port = _get_positive_int(dashboard_config, "port", section="dashboard", default=8765)
+    dashboard_base_path_raw = (
+        _get_optional_string(dashboard_config, "base_path", section="dashboard") or "/dashboard"
+    )
+    dashboard_base_path = _normalize_path_prefix(
+        dashboard_base_path_raw,
+        section="dashboard",
+        key="base_path",
+    )
+    dashboard_access_token = _get_optional_string(dashboard_config, "access_token", section="dashboard")
+    dashboard_ws_push_interval_ms = _get_positive_int(
+        dashboard_config,
+        "ws_push_interval_ms",
+        section="dashboard",
+        default=1000,
+    )
+    _validate_dashboard_host(dashboard_host, enabled=dashboard_enabled)
+    if dashboard_enabled and dashboard_access_token is None:
+        raise RuntimeError("[dashboard] access_token must be a non-empty string when dashboard is enabled")
+
     log_level = (_get_optional_string(bot_config, "log_level", section="bot") or "INFO").upper()
     if log_level not in _VALID_LOG_LEVELS:
         allowed = ", ".join(_VALID_LOG_LEVELS)
@@ -172,6 +201,12 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
         bot_metrics_interval_seconds=bot_metrics_interval_seconds,
         bot_stream_edit_interval_ms=bot_stream_edit_interval_ms,
         bot_latency_window_size=bot_latency_window_size,
+        dashboard_enabled=dashboard_enabled,
+        dashboard_host=dashboard_host,
+        dashboard_port=dashboard_port,
+        dashboard_base_path=dashboard_base_path,
+        dashboard_access_token=dashboard_access_token,
+        dashboard_ws_push_interval_ms=dashboard_ws_push_interval_ms,
         log_level=log_level,
     )
 
@@ -259,3 +294,28 @@ def _get_positive_int_list(table: dict[str, object], key: str, *, section: str) 
         values.append(item)
 
     return list(dict.fromkeys(values))
+
+
+def _get_bool(table: dict[str, object], key: str, *, section: str, default: bool) -> bool:
+    value = table.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise RuntimeError(f"[{section}] {key} must be a boolean")
+    return value
+
+
+def _normalize_path_prefix(value: str, *, section: str, key: str) -> str:
+    normalized = f"/{value.strip('/')}" if value.strip("/") else "/"
+    if normalized == "/":
+        raise RuntimeError(f"[{section}] {key} cannot be /")
+    return normalized
+
+
+def _validate_dashboard_host(host: str, *, enabled: bool) -> None:
+    if not enabled:
+        return
+    allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+    if host not in allowed_hosts:
+        allowed = ", ".join(sorted(allowed_hosts))
+        raise RuntimeError(f"[dashboard] host must be local-only when enabled ({allowed})")

@@ -75,6 +75,21 @@ class PiRuntime:
     def active_session_count(self) -> int:
         return len(self._pi_clients)
 
+    def session_snapshots(self) -> list[dict[str, str | float]]:
+        now = time.monotonic()
+        sessions: list[dict[str, str | float]] = []
+        for conversation_key, state in self._pi_clients.items():
+            sessions.append(
+                {
+                    "conversation_key": conversation_key,
+                    "session_dir": str(state.session_dir),
+                    "created_age_seconds": round(max(0.0, now - state.created_at_monotonic), 2),
+                    "idle_age_seconds": round(max(0.0, now - state.last_used_monotonic), 2),
+                }
+            )
+        sessions.sort(key=lambda item: item["idle_age_seconds"], reverse=True)
+        return sessions
+
     async def run_prompt(
         self,
         conversation_key: str,

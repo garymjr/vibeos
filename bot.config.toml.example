@@ -34,3 +34,14 @@ stream_edit_interval_ms = 700
 # Number of recent per-conversation latencies retained for percentile calculations.
 latency_window_size = 200
 log_level = "INFO"
+
+[dashboard]
+enabled = false
+# Local-only bind for safety.
+host = "127.0.0.1"
+port = 8765
+base_path = "/dashboard"
+# Required when dashboard is enabled.
+access_token = "replace-with-a-long-random-token"
+# Interval for websocket overview updates.
+ws_push_interval_ms = 1000

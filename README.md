@@ -56,11 +56,28 @@ Bot runtime behavior is configured under `[bot]`:
 - `stream_edit_interval_ms` throttles how frequently progress message edits are sent.
 - `latency_window_size` sets the sample window used for per-conversation latency percentiles.
 
+Dashboard behavior is configured under `[dashboard]`:
+
+- `enabled` toggles the local dashboard server.
+- `host` must stay local-only (`127.0.0.1`, `localhost`, or `::1`) when enabled.
+- `port` sets the HTTP listener.
+- `base_path` sets where the dashboard and API are mounted (for example `/dashboard`).
+- `access_token` is required and used as a Bearer token for API and websocket endpoints.
+- `ws_push_interval_ms` controls periodic websocket overview updates.
+
 ## Run
 
 ```bash
 uv run python3 main.py
 ```
+
+When dashboard is enabled, API endpoints are available under:
+
+- `/dashboard/api/overview`
+- `/dashboard/api/queue`
+- `/dashboard/api/sessions`
+- `/dashboard/api/config`
+- `/dashboard/ws/events` (websocket)
 
 ## Notes
 

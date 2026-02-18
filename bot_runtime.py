@@ -491,14 +491,45 @@ class PersonalAssistantBot:
         oldest_enqueued = min(self._queued_message_enqueued_at.values())
         return max(0.0, time.monotonic() - oldest_enqueued)
 
-    def _log_health_metrics(self, *, source: str) -> None:
+    def dashboard_overview_snapshot(self) -> dict[str, object]:
+        return {
+            "queue": self.dashboard_queue_snapshot(),
+            "runs": self.dashboard_run_snapshot(),
+            "sessions": self.dashboard_session_snapshot(),
+            "latency": self._latency_tracker.summary(),
+            "generated_at_unix": round(time.time(), 3),
+        }
+
+    def dashboard_queue_snapshot(self) -> dict[str, float | int]:
+        return {
+            "depth": self.message_queue.qsize(),
+            "oldest_age_seconds": round(self._queue_oldest_age_seconds(), 2),
+        }
+
+    def dashboard_run_snapshot(self) -> dict[str, int]:
         active_runs = sum(1 for lock in self._conversation_locks.values() if lock.locked())
+        return {
+            "active_runs": active_runs,
+            "worker_concurrency": self._worker_concurrency,
+            "active_conversations": len(self._conversation_locks),
+        }
+
+    def dashboard_session_snapshot(self) -> dict[str, object]:
+        return {
+            "active_session_count": self._pi_runtime.active_session_count,
+            "timeout_count": self._pi_runtime.timeout_count,
+            "sessions": self._pi_runtime.session_snapshots(),
+        }
+
+    def _log_health_metrics(self, *, source: str) -> None:
+        queue_snapshot = self.dashboard_queue_snapshot()
+        run_snapshot = self.dashboard_run_snapshot()
         LOGGER.info(
             "Health source=%s queue_depth=%s queue_oldest_age_s=%.2f active_runs=%s active_sessions=%s timeouts=%s latency=%s",
             source,
-            self.message_queue.qsize(),
-            self._queue_oldest_age_seconds(),
-            active_runs,
+            queue_snapshot["depth"],
+            queue_snapshot["oldest_age_seconds"],
+            run_snapshot["active_runs"],
             self._pi_runtime.active_session_count,
             self._pi_runtime.timeout_count,
             self._latency_tracker.summary(),
