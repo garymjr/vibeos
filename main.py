@@ -23,6 +23,43 @@ _PI_RPC_CLIENT_CLASS: Any | None = None
 _PI_RPC_ERROR_CLASS: type[Exception] = Exception
 
 DeltaHandler = Callable[[str], Awaitable[None]]
+_VALID_LOG_LEVELS: tuple[str, ...] = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+
+
+class _ComponentNameFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        component = record.name
+        if component.startswith("assistant."):
+            component = component.removeprefix("assistant.")
+        elif component.startswith("telegram.ext."):
+            component = f"telegram.{component.removeprefix('telegram.ext.')}"
+        elif component.startswith("telegram."):
+            component = component.removeprefix("telegram.")
+
+        record.component = component
+        return True
+
+
+def _configure_logging(log_level: str) -> None:
+    level = getattr(logging, log_level)
+    handler = logging.StreamHandler()
+    handler.addFilter(_ComponentNameFilter())
+    handler.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s | %(levelname)-7s | %(component)-24s | %(message)s",
+            datefmt="%H:%M:%S",
+        )
+    )
+
+    root = logging.getLogger()
+    for existing in root.handlers[:]:
+        root.removeHandler(existing)
+        existing.close()
+    root.setLevel(level)
+    root.addHandler(handler)
+
+    for logger_name in ("httpx", "httpcore"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 
 def _as_table(value: object, *, name: str) -> dict[str, object]:
@@ -189,6 +226,9 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
         default=200,
     )
     log_level = (_get_optional_string(bot_config, "log_level", section="bot") or "INFO").upper()
+    if log_level not in _VALID_LOG_LEVELS:
+        allowed = ", ".join(_VALID_LOG_LEVELS)
+        raise RuntimeError(f"[bot] log_level must be one of: {allowed}")
 
     pi_data_dir = Path(pi_data_dir_raw).expanduser().resolve() if pi_data_dir_raw else None
     if pi_data_dir is not None:
@@ -349,7 +389,7 @@ class PersonalAssistantBot:
         await self.message_queue.put(queued)
         self._queued_message_enqueued_at[self._message_key(message)] = enqueued_at
 
-        LOGGER.info(
+        LOGGER.debug(
             "Queued message %s from user %s in chat %s (queue=%s)",
             message.message_id,
             sender.id,
@@ -462,7 +502,7 @@ class PersonalAssistantBot:
         return lock
 
     async def _queue_worker(self, worker_id: int) -> None:
-        LOGGER.info("Queue worker %s started", worker_id)
+        LOGGER.debug("Queue worker %s started", worker_id)
         try:
             while True:
                 queued = await self.message_queue.get()
@@ -484,7 +524,7 @@ class PersonalAssistantBot:
                 finally:
                     self.message_queue.task_done()
         except asyncio.CancelledError:
-            LOGGER.info("Queue worker %s stopped", worker_id)
+            LOGGER.debug("Queue worker %s stopped", worker_id)
             raise
 
     async def _process_queued_message(self, queued: QueuedMessage) -> None:
@@ -574,7 +614,7 @@ class PersonalAssistantBot:
                 await self._publish_final_response(message.chat_id, status_message, response_text)
                 response_chars = len(response_text)
 
-                LOGGER.info("Run response delivered message=%s conversation=%s", message.message_id, conversation_key)
+                LOGGER.debug("Run response delivered message=%s conversation=%s", message.message_id, conversation_key)
             finally:
                 elapsed_seconds = time.monotonic() - started_at
                 self._record_latency(conversation_key, elapsed_seconds)
@@ -868,7 +908,7 @@ class PersonalAssistantBot:
                     prompt,
                     on_delta=on_delta,
                 )
-                LOGGER.info("Returned ephemeral pi response for %s", conversation_key)
+                LOGGER.debug("Returned ephemeral pi response for %s", conversation_key)
                 return response_text.strip()
             finally:
                 await asyncio.shield(
@@ -893,7 +933,7 @@ class PersonalAssistantBot:
         finally:
             state.last_used_monotonic = time.monotonic()
 
-        LOGGER.info("Returned pi response for %s", conversation_key)
+        LOGGER.debug("Returned pi response for %s", conversation_key)
         return response_text.strip()
 
     async def _stream_text_from_client_async(
@@ -962,7 +1002,7 @@ class PersonalAssistantBot:
             state.session_dir,
             True,
         )
-        LOGGER.info("Evicted pi client for %s reason=%s", conversation_key, reason)
+        LOGGER.debug("Evicted pi client for %s reason=%s", conversation_key, reason)
 
     async def _get_or_create_owner_dm_chat_id(self) -> int:
         application = self._require_application()
@@ -978,12 +1018,12 @@ class PersonalAssistantBot:
         if existing is not None:
             if force_session and self._pi_session_ttl_seconds == 0:
                 existing.last_used_monotonic = now
-                LOGGER.info("Resuming forced pi session for %s", conversation_key)
+                LOGGER.debug("Resuming forced pi session for %s", conversation_key)
                 return existing
 
             if self._pi_session_ttl_seconds > 0 and now - existing.last_used_monotonic < self._pi_session_ttl_seconds:
                 existing.last_used_monotonic = now
-                LOGGER.info("Resuming pi session for %s", conversation_key)
+                LOGGER.debug("Resuming pi session for %s", conversation_key)
                 return existing
 
             await self._evict_pi_client(conversation_key, reason="ttl-expired")
@@ -1010,7 +1050,7 @@ class PersonalAssistantBot:
 
         session_dir = self._pi_session_root / conversation_key / f"session-{time.time_ns()}"
         session_dir.mkdir(parents=True, exist_ok=True)
-        LOGGER.info("Starting pi session for %s", conversation_key)
+        LOGGER.debug("Starting pi session for %s", conversation_key)
         kwargs = self._build_pi_client_kwargs(
             force_no_session=force_no_session,
             session_dir=session_dir,
@@ -1055,7 +1095,7 @@ class PersonalAssistantBot:
     ) -> None:
         try:
             client.close()
-            LOGGER.info("Finished pi session for %s", conversation_key)
+            LOGGER.debug("Finished pi session for %s", conversation_key)
         except Exception:  # noqa: BLE001
             LOGGER.exception("Failed closing pi client for %s", conversation_key)
 
@@ -1178,12 +1218,7 @@ def _ensure_event_loop() -> None:
 
 def main() -> None:
     config = load_config()
-    level = getattr(logging, config.log_level, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    _configure_logging(config.log_level)
     provider = config.pi_provider or "<default>"
     model = config.pi_model or "<default>"
     LOGGER.info("Starting bot with pi provider=%s model=%s", provider, model)
