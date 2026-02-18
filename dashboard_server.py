@@ -85,6 +85,7 @@ class DashboardServer:
         app.router.add_get(f"{api_prefix}/sessions", self._json_handler(self._bot.dashboard_session_snapshot))
         app.router.add_get(f"{api_prefix}/config", self._handle_config)
         app.router.add_get(f"{base_path}/ws/events", self._handle_events_ws)
+        app.router.add_get("/assets/{tail:.*}", self._handle_root_assets)
         app.router.add_get(base_path, self._handle_dashboard)
         app.router.add_get(f"{base_path}/", self._handle_dashboard)
         app.router.add_get(f"{base_path}/{{tail:.*}}", self._handle_static_or_dashboard)
@@ -198,6 +199,19 @@ class DashboardServer:
         if candidate.is_file():
             return web.FileResponse(candidate)
         return await self._handle_dashboard(request)
+
+    async def _handle_root_assets(self, request: web.Request) -> web.StreamResponse:
+        asset_tail = request.match_info.get("tail", "")
+        asset_path = (self._frontend_dist / "assets" / asset_tail).resolve()
+        dist_root = self._frontend_dist.resolve()
+        try:
+            asset_path.relative_to(dist_root)
+        except ValueError:
+            raise web.HTTPNotFound from None
+
+        if asset_path.is_file():
+            return web.FileResponse(asset_path)
+        raise web.HTTPNotFound
 
     def _frontend_not_built_response(self) -> web.Response:
         return web.Response(
