@@ -560,6 +560,11 @@ class PersonalAssistantBot:
             except TelegramError:
                 LOGGER.exception("Failed to send initial progress message for %s", message.message_id)
 
+            try:
+                await self._react_to_message(message, "👀")
+            except TelegramError:
+                LOGGER.exception("Failed to react to message %s", message.message_id)
+
             async def on_delta(delta: str) -> None:
                 nonlocal streamed_text, last_edit_at, status_updates_enabled
 
@@ -686,6 +691,9 @@ class PersonalAssistantBot:
     async def _send_chat_action(self, chat_id: int, action: str) -> None:
         application = self._require_application()
         await application.bot.send_chat_action(chat_id=chat_id, action=action)
+
+    async def _react_to_message(self, message: Message, reaction: str) -> None:
+        await message.set_reaction(reaction=reaction)
 
     @staticmethod
     def _message_key(message: Message) -> tuple[int, int]:
