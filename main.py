@@ -274,12 +274,16 @@ class PersonalAssistantBot(discord.Client):
         if self._pi_session_ttl_seconds == 0:
             client = self._create_pi_client(conversation_key, force_no_session=True)
             try:
-                return "".join(client.stream_text(prompt)).strip()
+                response_text = "".join(client.stream_text(prompt)).strip()
+                LOGGER.info("Returned pi response for %s", conversation_key)
+                return response_text
             finally:
                 self._close_pi_client(conversation_key, client)
 
         client = self._get_pi_client(conversation_key)
-        return "".join(client.stream_text(prompt)).strip()
+        response_text = "".join(client.stream_text(prompt)).strip()
+        LOGGER.info("Returned pi response for %s", conversation_key)
+        return response_text
 
     def _get_pi_client(self, conversation_key: str) -> Any:
         if self._pi_session_ttl_seconds == 0:
@@ -289,8 +293,8 @@ class PersonalAssistantBot(discord.Client):
         pi_rpc_client_class, _ = _load_pi_sdk()
         existing = self._pi_clients.get(conversation_key)
         if existing is not None:
-            age_seconds = now - existing.created_at_monotonic
-            if age_seconds < self._pi_session_ttl_seconds:
+            if now - existing.created_at_monotonic < self._pi_session_ttl_seconds:
+                LOGGER.info("Resuming pi session for %s", conversation_key)
                 return existing.client
             self._close_pi_client(conversation_key, existing.client)
             del self._pi_clients[conversation_key]
@@ -311,11 +315,13 @@ class PersonalAssistantBot(discord.Client):
 
         session_dir = self._pi_session_root / conversation_key / f"session-{time.time_ns()}"
         session_dir.mkdir(parents=True, exist_ok=True)
+        effective_no_session = self._pi_no_session or force_no_session
+        LOGGER.info("Starting pi session for %s", conversation_key)
         client = pi_rpc_client_class(
             executable=self._pi_executable,
             provider=self._pi_provider,
             model=self._pi_model,
-            no_session=self._pi_no_session or force_no_session,
+            no_session=effective_no_session,
             session_dir=session_dir,
         )
         client.start()
@@ -330,6 +336,7 @@ class PersonalAssistantBot(discord.Client):
     def _close_pi_client(conversation_key: str, client: Any) -> None:
         try:
             client.close()
+            LOGGER.info("Finished pi session for %s", conversation_key)
         except Exception:  # noqa: BLE001
             LOGGER.exception("Failed closing pi client for %s", conversation_key)
 
