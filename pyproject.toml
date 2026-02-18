@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "aiohttp>=3.13,<4",
+    "croniter>=6.0,<7",
     "python-telegram-bot>=21.0,<22.0",
     "pi_sdk @ git+https://github.com/garymjr/pi_sdk.git",
 ]

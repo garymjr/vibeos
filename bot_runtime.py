@@ -10,6 +10,7 @@ from telegram.error import TelegramError
 from telegram.ext import Application, ContextTypes
 
 from configuration import BotConfig
+from cron_runtime import CronJob, CronRunOutcome, CronScheduler
 from message_utils import (
     QueuedMessage,
     conversation_key,
@@ -52,6 +53,14 @@ class PersonalAssistantBot:
         self._pi_session_sweeper_interval_seconds = config.pi_session_sweeper_interval_seconds
 
         self._pi_runtime = PiRuntime(config)
+        self._cron_scheduler = CronScheduler(
+            enabled=config.cron_enabled,
+            store_path=config.cron_store_path,
+            max_sleep_seconds=config.cron_max_sleep_seconds,
+            max_concurrent_runs=config.cron_max_concurrent_runs,
+            default_timeout_seconds=config.cron_job_timeout_seconds,
+            executor=self._execute_cron_job,
+        )
 
     async def on_ready(self, application: Application) -> None:
         self._application = application
@@ -84,6 +93,8 @@ class PersonalAssistantBot:
         if self._metrics_interval_seconds > 0 and (self._metrics_task is None or self._metrics_task.done()):
             self._metrics_task = asyncio.create_task(self._metrics_worker(), name="metrics-worker")
             LOGGER.info("Metrics worker started with interval=%ss", self._metrics_interval_seconds)
+
+        await self._cron_scheduler.start()
 
     async def on_message(self, update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
@@ -167,6 +178,7 @@ class PersonalAssistantBot:
             await asyncio.gather(*self._queue_worker_tasks, return_exceptions=True)
         self._queue_worker_tasks = []
 
+        await self._cron_scheduler.stop()
         await self._pi_runtime.close_all_clients()
 
     async def _cancel_task(self, task: asyncio.Task[None] | None, name: str) -> None:
@@ -496,6 +508,7 @@ class PersonalAssistantBot:
             "queue": self.dashboard_queue_snapshot(),
             "runs": self.dashboard_run_snapshot(),
             "sessions": self.dashboard_session_snapshot(),
+            "cron": self.dashboard_cron_snapshot(),
             "latency": self._latency_tracker.summary(),
             "generated_at_unix": round(time.time(), 3),
         }
@@ -521,16 +534,118 @@ class PersonalAssistantBot:
             "sessions": self._pi_runtime.session_snapshots(),
         }
 
+    def dashboard_cron_snapshot(self) -> dict[str, object]:
+        return self._cron_scheduler.dashboard_snapshot()
+
     def _log_health_metrics(self, *, source: str) -> None:
         queue_snapshot = self.dashboard_queue_snapshot()
         run_snapshot = self.dashboard_run_snapshot()
+        cron_snapshot = self.dashboard_cron_snapshot()
         LOGGER.info(
-            "Health source=%s queue_depth=%s queue_oldest_age_s=%.2f active_runs=%s active_sessions=%s timeouts=%s latency=%s",
+            "Health source=%s queue_depth=%s queue_oldest_age_s=%.2f active_runs=%s active_sessions=%s timeouts=%s cron_jobs=%s cron_due=%s latency=%s",
             source,
             queue_snapshot["depth"],
             queue_snapshot["oldest_age_seconds"],
             run_snapshot["active_runs"],
             self._pi_runtime.active_session_count,
             self._pi_runtime.timeout_count,
+            cron_snapshot["job_count"],
+            cron_snapshot["due_count"],
             self._latency_tracker.summary(),
         )
+
+    async def _execute_cron_job(self, job: CronJob) -> CronRunOutcome:
+        job_id = job["id"]
+        job_name = job["name"]
+        payload = job["payload"]
+        prompt = payload.get("prompt", "").strip()
+        if not prompt:
+            return CronRunOutcome(status="skipped", error="cron prompt is empty")
+
+        force_ephemeral = bool(payload.get("force_ephemeral", False))
+        force_session = bool(payload.get("force_session", False))
+        if force_ephemeral and force_session:
+            return CronRunOutcome(
+                status="error",
+                error="force_ephemeral and force_session cannot both be true",
+            )
+
+        session_target = payload.get("session_target", "owner")
+        notify_owner = bool(payload.get("notify_owner", True))
+
+        if session_target == "owner":
+            owner_chat_id = await self._get_or_create_owner_dm_chat_id()
+            conversation_key_value = dm_conversation_key(self._bot_owner_user_id, owner_chat_id)
+            effective_force_session = force_session or not force_ephemeral
+        else:
+            owner_chat_id = None
+            conversation_key_value = f"cron-job-{job_id}"
+            effective_force_session = force_session
+
+        lock = self._conversation_lock(conversation_key_value)
+        started_at = time.monotonic()
+        run_status: CronRunOutcome
+        _, pi_error_type = load_pi_sdk()
+
+        cron_prompt = (
+            "Automated cron job execution.\n"
+            f"Job id: {job_id}\n"
+            f"Job name: {job_name}\n"
+            f"Scheduled at: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n\n"
+            f"{prompt}"
+        )
+
+        try:
+            async with lock:
+                response_text = await self._pi_runtime.run_prompt(
+                    conversation_key_value,
+                    cron_prompt,
+                    force_ephemeral=force_ephemeral,
+                    force_session=effective_force_session,
+                )
+            output_text = response_text.strip() or "Cron run completed with an empty response."
+            run_status = CronRunOutcome(status="ok", summary=output_text)
+        except asyncio.TimeoutError:
+            run_status = CronRunOutcome(status="error", error="cron execution timed out")
+        except pi_error_type as exc:
+            run_status = CronRunOutcome(status="error", error=f"pi error: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Cron job failed id=%s name=%s", job_id, job_name)
+            run_status = CronRunOutcome(status="error", error=str(exc))
+
+        if notify_owner:
+            destination_chat_id = owner_chat_id or await self._get_or_create_owner_dm_chat_id()
+            await self._notify_owner_cron_result(destination_chat_id, job, run_status)
+
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
+        LOGGER.info(
+            "Cron job finished id=%s name=%s status=%s duration_ms=%s",
+            job_id,
+            job_name,
+            run_status.status,
+            elapsed_ms,
+        )
+        return run_status
+
+    async def _notify_owner_cron_result(
+        self,
+        owner_chat_id: int,
+        job: CronJob,
+        outcome: CronRunOutcome,
+    ) -> None:
+        try:
+            if outcome.status == "ok":
+                body = outcome.summary or "Cron run completed."
+            elif outcome.status == "skipped":
+                body = outcome.error or "Cron run skipped."
+            else:
+                body = outcome.error or "Cron run failed."
+
+            message = (
+                f"Cron {outcome.status.upper()}: {job['name']} ({job['id']})\n"
+                f"{body}"
+            )
+            for chunk in split_for_telegram(message):
+                await self._send_text(owner_chat_id, chunk)
+        except TelegramError:
+            LOGGER.exception("Failed sending cron update for job %s", job["id"])

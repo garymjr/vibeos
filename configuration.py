@@ -51,6 +51,11 @@ class BotConfig:
     dashboard_base_path: str
     dashboard_access_token: str | None
     dashboard_ws_push_interval_ms: int
+    cron_enabled: bool
+    cron_store_path: Path
+    cron_max_sleep_seconds: int
+    cron_max_concurrent_runs: int
+    cron_job_timeout_seconds: int
     log_level: str
 
 
@@ -97,6 +102,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
     pi_config = _as_table(config_data.get("pi"), name="pi")
     bot_config = _as_table(config_data.get("bot"), name="bot")
     dashboard_config = _as_table(config_data.get("dashboard"), name="dashboard")
+    cron_config = _as_table(config_data.get("cron"), name="cron")
 
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -172,6 +178,29 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
         section="dashboard",
         default=1000,
     )
+    cron_enabled = _get_bool(cron_config, "enabled", section="cron", default=False)
+    cron_store_path_raw = (
+        _get_optional_string(cron_config, "store_path", section="cron")
+        or "~/.vibeos/cron/jobs.json"
+    )
+    cron_max_sleep_seconds = _get_positive_int(
+        cron_config,
+        "max_sleep_seconds",
+        section="cron",
+        default=30,
+    )
+    cron_max_concurrent_runs = _get_positive_int(
+        cron_config,
+        "max_concurrent_runs",
+        section="cron",
+        default=1,
+    )
+    cron_job_timeout_seconds = _get_non_negative_int(
+        cron_config,
+        "job_timeout_seconds",
+        section="cron",
+        default=300,
+    )
     _validate_dashboard_host(dashboard_host, enabled=dashboard_enabled)
     if dashboard_enabled and dashboard_access_token is None:
         raise RuntimeError("[dashboard] access_token must be a non-empty string when dashboard is enabled")
@@ -209,6 +238,11 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
         dashboard_base_path=dashboard_base_path,
         dashboard_access_token=dashboard_access_token,
         dashboard_ws_push_interval_ms=dashboard_ws_push_interval_ms,
+        cron_enabled=cron_enabled,
+        cron_store_path=Path(cron_store_path_raw).expanduser().resolve(),
+        cron_max_sleep_seconds=cron_max_sleep_seconds,
+        cron_max_concurrent_runs=cron_max_concurrent_runs,
+        cron_job_timeout_seconds=cron_job_timeout_seconds,
         log_level=log_level,
     )
 

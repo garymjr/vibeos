@@ -45,3 +45,14 @@ base_path = "/dashboard"
 access_token = "replace-with-a-long-random-token"
 # Interval for websocket overview updates.
 ws_push_interval_ms = 1000
+
+[cron]
+enabled = false
+# JSON store for cron jobs.
+store_path = "~/.vibeos/cron/jobs.json"
+# Maximum scheduler sleep between checks.
+max_sleep_seconds = 30
+# Maximum concurrently running cron jobs.
+max_concurrent_runs = 1
+# Per-job timeout for cron execution. 0 disables timeout.
+job_timeout_seconds = 300

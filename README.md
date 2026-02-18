@@ -72,6 +72,14 @@ Dashboard behavior is configured under `[dashboard]`:
 - `access_token` is required and used as a Bearer token for API and websocket endpoints.
 - `ws_push_interval_ms` controls periodic websocket overview updates.
 
+Cron behavior is configured under `[cron]`:
+
+- `enabled` toggles cron scheduling.
+- `store_path` points to the JSON file that stores scheduled jobs.
+- `max_sleep_seconds` controls the maximum idle wait in the scheduler loop.
+- `max_concurrent_runs` limits how many cron jobs can execute in parallel.
+- `job_timeout_seconds` enforces a per-job timeout (`0` disables timeout).
+
 ## Run
 
 ```bash
@@ -83,6 +91,7 @@ When dashboard is enabled, API endpoints are available under:
 - `/dashboard/api/overview`
 - `/dashboard/api/queue`
 - `/dashboard/api/sessions`
+- `/dashboard/api/cron`
 - `/dashboard/api/config`
 - `/dashboard/ws/events` (websocket)
 

@@ -1,6 +1,6 @@
 import { For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 
-type TabKey = "overview" | "queue" | "sessions" | "latency";
+type TabKey = "overview" | "queue" | "sessions" | "cron" | "latency";
 type ConnectionState = "idle" | "connecting" | "live" | "error";
 
 interface QueueSnapshot {
@@ -27,6 +27,27 @@ interface SessionSnapshot {
   sessions: SessionEntry[];
 }
 
+interface CronJobEntry {
+  id: string;
+  name: string;
+  enabled: boolean;
+  schedule_kind: string;
+  schedule_text: string;
+  next_run_at_unix: number | null;
+  running: boolean;
+  last_status: string | null;
+  last_error: string | null;
+  last_run_at_unix: number | null;
+}
+
+interface CronSnapshot {
+  enabled: boolean;
+  store_path: string;
+  job_count: number;
+  due_count: number;
+  jobs: CronJobEntry[];
+}
+
 interface LatencyEntry {
   count: number;
   p50_ms: number;
@@ -38,6 +59,7 @@ interface OverviewPayload {
   queue: QueueSnapshot;
   runs: RunSnapshot;
   sessions: SessionSnapshot;
+  cron: CronSnapshot;
   latency: Record<string, LatencyEntry>;
   generated_at_unix: number;
 }
@@ -82,6 +104,13 @@ const TAB_META: ReadonlyArray<TabMeta> = [
     group: "runtime",
   },
   {
+    key: "cron",
+    label: "Cron",
+    subtitle: "Scheduled automation jobs and their execution state.",
+    icon: "⏲",
+    group: "runtime",
+  },
+  {
     key: "latency",
     label: "Latency",
     subtitle: "Per-conversation percentile response times.",
@@ -91,7 +120,7 @@ const TAB_META: ReadonlyArray<TabMeta> = [
 ];
 
 const TAB_GROUPS: ReadonlyArray<{ label: string; tabs: TabKey[] }> = [
-  { label: "runtime", tabs: ["overview", "queue", "sessions"] },
+  { label: "runtime", tabs: ["overview", "queue", "sessions", "cron"] },
   { label: "analytics", tabs: ["latency"] },
 ];
 
@@ -117,7 +146,7 @@ function inferBasePath(pathname: string): string {
 function parseTab(pathname: string, basePath: string): TabKey {
   const relative = pathname.replace(basePath, "") || "/";
   const candidate = relative.replace(/^\//, "").split("/")[0];
-  if (candidate === "queue" || candidate === "sessions" || candidate === "latency") {
+  if (candidate === "queue" || candidate === "sessions" || candidate === "cron" || candidate === "latency") {
     return candidate;
   }
   return "overview";
@@ -146,6 +175,26 @@ function formatTimestamp(unixSeconds: number): string {
   return new Date(unixSeconds * 1000).toLocaleTimeString();
 }
 
+function formatDateTime(unixSeconds: number | null): string {
+  if (!unixSeconds) {
+    return "n/a";
+  }
+  return new Date(unixSeconds * 1000).toLocaleString();
+}
+
+function cronStatusText(job: CronJobEntry): string {
+  if (job.running) {
+    return "running";
+  }
+  if (!job.enabled) {
+    return "disabled";
+  }
+  if (job.last_status) {
+    return job.last_status;
+  }
+  return "pending";
+}
+
 function statusLabel(state: ConnectionState): string {
   if (state === "live") {
     return "ok";
@@ -167,7 +216,11 @@ export default function App() {
   const basePath = inferBasePath(window.location.pathname);
   const storedTab = localStorage.getItem(TAB_STORAGE_KEY);
   const initialTab =
-    storedTab === "overview" || storedTab === "queue" || storedTab === "sessions" || storedTab === "latency"
+    storedTab === "overview" ||
+    storedTab === "queue" ||
+    storedTab === "sessions" ||
+    storedTab === "cron" ||
+    storedTab === "latency"
       ? storedTab
       : parseTab(window.location.pathname, basePath);
 
@@ -467,6 +520,8 @@ export default function App() {
                       <div><span class="label">Oldest Queue Age</span><span>{formatDuration(payload().queue.oldest_age_seconds)}</span></div>
                       <div><span class="label">Active Runs</span><span>{payload().runs.active_runs}</span></div>
                       <div><span class="label">Session Clients</span><span>{payload().sessions.active_session_count}</span></div>
+                      <div><span class="label">Scheduled Jobs</span><span>{payload().cron.job_count}</span></div>
+                      <div><span class="label">Due Jobs</span><span>{payload().cron.due_count}</span></div>
                       <div><span class="label">Timeout Count</span><span>{payload().sessions.timeout_count}</span></div>
                     </div>
                   </article>
@@ -476,6 +531,8 @@ export default function App() {
                   <article class="stat"><div class="stat-label">Workers</div><div class="stat-value">{payload().runs.worker_concurrency}</div></article>
                   <article class="stat"><div class="stat-label">Conversations</div><div class="stat-value">{payload().runs.active_conversations}</div></article>
                   <article class="stat"><div class="stat-label">Live Sessions</div><div class="stat-value">{payload().sessions.active_session_count}</div></article>
+                  <article class="stat"><div class="stat-label">Cron Jobs</div><div class="stat-value">{payload().cron.job_count}</div></article>
+                  <article class="stat"><div class="stat-label">Cron Due</div><div class="stat-value">{payload().cron.due_count}</div></article>
                   <article class="stat"><div class="stat-label">Timeouts</div><div class="stat-value">{payload().sessions.timeout_count}</div></article>
                 </section>
               </Show>
@@ -519,6 +576,57 @@ export default function App() {
                                 <td>{formatDuration(session.idle_age_seconds)}</td>
                                 <td>{formatDuration(session.created_age_seconds)}</td>
                                 <td class="mono">{session.session_dir}</td>
+                              </tr>
+                            )}
+                          </For>
+                        </tbody>
+                      </table>
+                    </div>
+                  </Show>
+                </section>
+              </Show>
+
+              <Show when={selectedTab() === "cron"}>
+                <section class="card">
+                  <div class="card-title">Scheduled Jobs</div>
+                  <div class="card-sub">
+                    Store: <span class="mono">{payload().cron.store_path}</span>
+                  </div>
+                  <div class="status-list" style="margin-top: 12px;">
+                    <div><span class="label">Scheduler enabled</span><span>{payload().cron.enabled ? "yes" : "no"}</span></div>
+                    <div><span class="label">Total jobs</span><span>{payload().cron.job_count}</span></div>
+                    <div><span class="label">Due now</span><span>{payload().cron.due_count}</span></div>
+                  </div>
+
+                  <Show when={payload().cron.jobs.length > 0} fallback={<div class="card-sub" style="margin-top: 14px;">No scheduled cron jobs.</div>}>
+                    <div class="table-wrap" style="margin-top: 12px;">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Name</th>
+                            <th>Status</th>
+                            <th>Schedule</th>
+                            <th>Next Run</th>
+                            <th>Last Run</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <For each={payload().cron.jobs}>
+                            {(job) => (
+                              <tr>
+                                <td>
+                                  <div>{job.name}</div>
+                                  <div class="mono">{job.id}</div>
+                                </td>
+                                <td>{cronStatusText(job)}</td>
+                                <td class="mono">{job.schedule_text}</td>
+                                <td>{formatDateTime(job.next_run_at_unix)}</td>
+                                <td>
+                                  <div>{formatDateTime(job.last_run_at_unix)}</div>
+                                  <Show when={job.last_error}>
+                                    <div class="label">{job.last_error}</div>
+                                  </Show>
+                                </td>
                               </tr>
                             )}
                           </For>

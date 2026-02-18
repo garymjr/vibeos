@@ -83,6 +83,7 @@ class DashboardServer:
         app.router.add_get(f"{api_prefix}/overview", self._json_handler(self._bot.dashboard_overview_snapshot))
         app.router.add_get(f"{api_prefix}/queue", self._json_handler(self._bot.dashboard_queue_snapshot))
         app.router.add_get(f"{api_prefix}/sessions", self._json_handler(self._bot.dashboard_session_snapshot))
+        app.router.add_get(f"{api_prefix}/cron", self._json_handler(self._bot.dashboard_cron_snapshot))
         app.router.add_get(f"{api_prefix}/config", self._handle_config)
         app.router.add_get(f"{base_path}/ws/events", self._handle_events_ws)
         app.router.add_get("/assets/{tail:.*}", self._handle_root_assets)
@@ -128,6 +129,7 @@ class DashboardServer:
                 "overview": f"{self._base_path}/api/overview",
                 "queue": f"{self._base_path}/api/queue",
                 "sessions": f"{self._base_path}/api/sessions",
+                "cron": f"{self._base_path}/api/cron",
                 "config": f"{self._base_path}/api/config",
             },
             "ws_path": f"{self._base_path}/ws/events",
