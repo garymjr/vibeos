@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import time
 import tomllib
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import discord
 
@@ -16,6 +18,8 @@ DEFAULT_CONFIG_PATH = Path("bot.config.toml")
 
 _PI_RPC_CLIENT_CLASS: Any | None = None
 _PI_RPC_ERROR_CLASS: type[Exception] = Exception
+
+DeltaHandler = Callable[[str], Awaitable[None]]
 
 
 def _as_table(value: object, *, name: str) -> dict[str, object]:
@@ -95,8 +99,14 @@ class BotConfig:
     pi_data_dir: Path | None
     pi_session_root: Path
     pi_session_ttl_seconds: int
+    pi_call_timeout_seconds: int
+    pi_session_sweeper_interval_seconds: int
     bot_queue_maxsize: int
+    bot_worker_concurrency: int
     bot_heartbeat_interval_seconds: int
+    bot_metrics_interval_seconds: int
+    bot_stream_edit_interval_ms: int
+    bot_latency_window_size: int
     log_level: str
 
 
@@ -124,6 +134,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
     token = _get_required_string(discord_config, "bot_token", section="discord")
     owner_user_id = _get_required_positive_int(discord_config, "bot_owner_user_id", section="discord")
     trusted_user_ids = _get_positive_int_list(discord_config, "trusted_user_ids", section="discord")
+
     pi_executable = _get_optional_string(pi_config, "executable", section="pi") or "pi"
     pi_provider = _get_optional_string(pi_config, "provider", section="pi")
     pi_model = _get_optional_string(pi_config, "model", section="pi")
@@ -135,12 +146,44 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
         section="pi",
         default=0,
     )
+    pi_call_timeout_seconds = _get_non_negative_int(
+        pi_config,
+        "call_timeout_seconds",
+        section="pi",
+        default=180,
+    )
+    pi_session_sweeper_interval_seconds = _get_non_negative_int(
+        pi_config,
+        "session_sweeper_interval_seconds",
+        section="pi",
+        default=60,
+    )
+
     bot_queue_maxsize = _get_positive_int(bot_config, "queue_maxsize", section="bot", default=1000)
+    bot_worker_concurrency = _get_positive_int(bot_config, "worker_concurrency", section="bot", default=4)
     bot_heartbeat_interval_seconds = _get_non_negative_int(
         bot_config,
         "heartbeat_interval_seconds",
         section="bot",
         default=0,
+    )
+    bot_metrics_interval_seconds = _get_non_negative_int(
+        bot_config,
+        "metrics_interval_seconds",
+        section="bot",
+        default=60,
+    )
+    bot_stream_edit_interval_ms = _get_positive_int(
+        bot_config,
+        "stream_edit_interval_ms",
+        section="bot",
+        default=700,
+    )
+    bot_latency_window_size = _get_positive_int(
+        bot_config,
+        "latency_window_size",
+        section="bot",
+        default=200,
     )
     log_level = (_get_optional_string(bot_config, "log_level", section="bot") or "INFO").upper()
 
@@ -158,8 +201,14 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> BotConfig:
         pi_data_dir=pi_data_dir,
         pi_session_root=Path(pi_session_root).expanduser().resolve(),
         pi_session_ttl_seconds=pi_session_ttl_seconds,
+        pi_call_timeout_seconds=pi_call_timeout_seconds,
+        pi_session_sweeper_interval_seconds=pi_session_sweeper_interval_seconds,
         bot_queue_maxsize=bot_queue_maxsize,
+        bot_worker_concurrency=bot_worker_concurrency,
         bot_heartbeat_interval_seconds=bot_heartbeat_interval_seconds,
+        bot_metrics_interval_seconds=bot_metrics_interval_seconds,
+        bot_stream_edit_interval_ms=bot_stream_edit_interval_ms,
+        bot_latency_window_size=bot_latency_window_size,
         log_level=log_level,
     )
 
@@ -194,12 +243,15 @@ def _configure_pi_environment(config: BotConfig) -> None:
 class QueuedMessage:
     message: discord.Message
     content: str
+    enqueued_at_monotonic: float
 
 
 @dataclass(slots=True)
 class PiClientState:
     client: Any
     created_at_monotonic: float
+    last_used_monotonic: float
+    session_dir: Path
 
 
 class PersonalAssistantBot(discord.Client):
@@ -209,10 +261,19 @@ class PersonalAssistantBot(discord.Client):
         super().__init__(intents=intents)
 
         self.message_queue: asyncio.Queue[QueuedMessage] = asyncio.Queue(maxsize=config.bot_queue_maxsize)
-        self._queue_worker_task: asyncio.Task[None] | None = None
+        self._queue_worker_tasks: list[asyncio.Task[None]] = []
+        self._next_worker_id = 1
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._session_sweeper_task: asyncio.Task[None] | None = None
+        self._metrics_task: asyncio.Task[None] | None = None
+
         self._pi_clients: dict[str, PiClientState] = {}
-        self._pi_lock = asyncio.Lock()
+        self._conversation_locks: dict[str, asyncio.Lock] = {}
+        self._queued_message_enqueued_at: dict[int, float] = {}
+        self._conversation_latency_seconds: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=config.bot_latency_window_size)
+        )
+        self._timeout_count = 0
 
         self._bot_owner_user_id = config.discord_bot_owner_user_id
         self._trusted_user_ids = set(config.discord_trusted_user_ids)
@@ -222,18 +283,44 @@ class PersonalAssistantBot(discord.Client):
         self._pi_data_dir = config.pi_data_dir
         self._pi_session_root = config.pi_session_root
         self._pi_session_ttl_seconds = config.pi_session_ttl_seconds
+        self._pi_call_timeout_seconds = config.pi_call_timeout_seconds
+        self._pi_session_sweeper_interval_seconds = config.pi_session_sweeper_interval_seconds
+        self._session_cleanup_ttl_seconds = config.pi_session_ttl_seconds if config.pi_session_ttl_seconds > 0 else 1800
+
+        self._worker_concurrency = config.bot_worker_concurrency
         self._heartbeat_interval_seconds = config.bot_heartbeat_interval_seconds
+        self._metrics_interval_seconds = config.bot_metrics_interval_seconds
+        self._stream_edit_interval_seconds = config.bot_stream_edit_interval_ms / 1000
+
+        self._pi_session_root.mkdir(parents=True, exist_ok=True)
 
     async def on_ready(self) -> None:
         LOGGER.info("Discord bot connected as %s (id=%s)", self.user, self.user.id if self.user else "unknown")
-        if self._queue_worker_task is None or self._queue_worker_task.done():
-            self._queue_worker_task = asyncio.create_task(self._queue_worker(), name="discord-message-queue-worker")
+        self._ensure_queue_workers()
+
         if (
             self._heartbeat_interval_seconds > 0
             and (self._heartbeat_task is None or self._heartbeat_task.done())
         ):
             self._heartbeat_task = asyncio.create_task(self._heartbeat_worker(), name="heartbeat-worker")
             LOGGER.info("Heartbeat worker started with interval=%ss", self._heartbeat_interval_seconds)
+
+        if (
+            self._pi_session_sweeper_interval_seconds > 0
+            and (self._session_sweeper_task is None or self._session_sweeper_task.done())
+        ):
+            self._session_sweeper_task = asyncio.create_task(
+                self._session_sweeper_worker(),
+                name="pi-session-sweeper-worker",
+            )
+            LOGGER.info(
+                "Session sweeper started with interval=%ss",
+                self._pi_session_sweeper_interval_seconds,
+            )
+
+        if self._metrics_interval_seconds > 0 and (self._metrics_task is None or self._metrics_task.done()):
+            self._metrics_task = asyncio.create_task(self._metrics_worker(), name="metrics-worker")
+            LOGGER.info("Metrics worker started with interval=%ss", self._metrics_interval_seconds)
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.is_system():
@@ -247,8 +334,11 @@ class PersonalAssistantBot(discord.Client):
         if not text:
             return
 
-        queued = QueuedMessage(message=message, content=text)
+        enqueued_at = time.monotonic()
+        queued = QueuedMessage(message=message, content=text, enqueued_at_monotonic=enqueued_at)
         await self.message_queue.put(queued)
+        self._queued_message_enqueued_at[message.id] = enqueued_at
+
         LOGGER.info(
             "Queued message %s from user %s in channel %s (queue=%s)",
             message.id,
@@ -256,6 +346,31 @@ class PersonalAssistantBot(discord.Client):
             message.channel.id,
             self.message_queue.qsize(),
         )
+
+    def _ensure_queue_workers(self) -> None:
+        alive_workers: list[asyncio.Task[None]] = []
+        for task in self._queue_worker_tasks:
+            if task.done():
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    LOGGER.error("Queue worker exited with an error", exc_info=exc)
+                continue
+            alive_workers.append(task)
+
+        self._queue_worker_tasks = alive_workers
+
+        while len(self._queue_worker_tasks) < self._worker_concurrency:
+            worker_id = self._next_worker_id
+            self._next_worker_id += 1
+            task = asyncio.create_task(
+                self._queue_worker(worker_id),
+                name=f"discord-message-queue-worker-{worker_id}",
+            )
+            self._queue_worker_tasks.append(task)
+
+        LOGGER.info("Queue worker pool ready (workers=%s)", len(self._queue_worker_tasks))
 
     def _is_authorized_user(self, user_id: int) -> bool:
         return user_id == self._bot_owner_user_id or user_id in self._trusted_user_ids
@@ -265,40 +380,66 @@ class PersonalAssistantBot(discord.Client):
         return current_user is not None and current_user.id in message.raw_mentions
 
     async def close(self) -> None:
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            self._heartbeat_task = None
+        await self._cancel_task(self._heartbeat_task, "heartbeat worker")
+        self._heartbeat_task = None
 
-        if self._queue_worker_task is not None:
-            self._queue_worker_task.cancel()
-            try:
-                await self._queue_worker_task
-            except asyncio.CancelledError:
-                pass
-            self._queue_worker_task = None
+        await self._cancel_task(self._session_sweeper_task, "session sweeper")
+        self._session_sweeper_task = None
+
+        await self._cancel_task(self._metrics_task, "metrics worker")
+        self._metrics_task = None
+
+        for task in self._queue_worker_tasks:
+            task.cancel()
+        if self._queue_worker_tasks:
+            await asyncio.gather(*self._queue_worker_tasks, return_exceptions=True)
+        self._queue_worker_tasks = []
 
         await asyncio.to_thread(self._close_pi_clients)
         await super().close()
 
-    async def _queue_worker(self) -> None:
-        while True:
-            queued = await self.message_queue.get()
-            try:
-                await self._process_queued_message(queued)
-            except Exception:  # noqa: BLE001
-                LOGGER.exception("Unexpected error while handling queued message %s", queued.message.id)
+    async def _cancel_task(self, task: asyncio.Task[None] | None, name: str) -> None:
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            LOGGER.info("%s stopped", name)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("%s failed during shutdown", name)
+
+    def _conversation_lock(self, conversation_key: str) -> asyncio.Lock:
+        lock = self._conversation_locks.get(conversation_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._conversation_locks[conversation_key] = lock
+        return lock
+
+    async def _queue_worker(self, worker_id: int) -> None:
+        LOGGER.info("Queue worker %s started", worker_id)
+        try:
+            while True:
+                queued = await self.message_queue.get()
+                self._queued_message_enqueued_at.pop(queued.message.id, None)
                 try:
-                    await queued.message.channel.send(
-                        "I hit an unexpected error while processing that message. Please try again."
-                    )
-                except discord.DiscordException:
-                    LOGGER.exception("Failed to send unexpected-error message for queued message %s", queued.message.id)
-            finally:
-                self.message_queue.task_done()
+                    await self._process_queued_message(queued)
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Unexpected error while handling queued message %s", queued.message.id)
+                    try:
+                        await queued.message.channel.send(
+                            "I hit an unexpected error while processing that message. Please try again."
+                        )
+                    except discord.DiscordException:
+                        LOGGER.exception(
+                            "Failed to send unexpected-error message for queued message %s",
+                            queued.message.id,
+                        )
+                finally:
+                    self.message_queue.task_done()
+        except asyncio.CancelledError:
+            LOGGER.info("Queue worker %s stopped", worker_id)
+            raise
 
     async def _process_queued_message(self, queued: QueuedMessage) -> None:
         message = queued.message
@@ -307,20 +448,143 @@ class PersonalAssistantBot(discord.Client):
         force_session = message.guild is None and message.author.id == self._bot_owner_user_id
         _, pi_error_type = _load_pi_sdk()
 
-        LOGGER.info("Processing queued message %s for %s", message.id, conversation_key)
-        try:
-            async with message.channel.typing():
-                response_text = await self._run_pi_prompt_async(conversation_key, prompt, force_session=force_session)
-        except pi_error_type as exc:
-            LOGGER.exception("pi_sdk error for message %s: %s", message.id, exc)
-            await message.channel.send(f"pi error: {exc}")
-            return
+        queue_wait_seconds = max(0.0, time.monotonic() - queued.enqueued_at_monotonic)
+        lock = self._conversation_lock(conversation_key)
 
-        if not response_text.strip():
-            response_text = "I did not get a response from pi for that message."
+        async with lock:
+            started_at = time.monotonic()
+            outcome = "success"
+            response_chars = 0
+            LOGGER.info(
+                "Run started message=%s conversation=%s queue_wait_ms=%.0f",
+                message.id,
+                conversation_key,
+                queue_wait_seconds * 1000,
+            )
 
-        for chunk in self._split_for_discord(response_text):
-            await message.channel.send(chunk)
+            status_message: discord.Message | None = None
+            status_updates_enabled = True
+            streamed_text = ""
+            last_edit_at = 0.0
+
+            try:
+                status_message = await message.channel.send("Thinking...")
+            except discord.DiscordException:
+                LOGGER.exception("Failed to send initial progress message for %s", message.id)
+
+            async def on_delta(delta: str) -> None:
+                nonlocal streamed_text, last_edit_at, status_updates_enabled
+
+                if not delta:
+                    return
+
+                streamed_text += delta
+                if status_message is None or not status_updates_enabled:
+                    return
+
+                now = time.monotonic()
+                if now - last_edit_at < self._stream_edit_interval_seconds:
+                    return
+
+                preview = self._stream_preview(streamed_text)
+                try:
+                    await status_message.edit(content=preview)
+                    last_edit_at = now
+                except discord.DiscordException:
+                    status_updates_enabled = False
+                    LOGGER.exception("Failed to edit streaming response for %s", message.id)
+
+            try:
+                try:
+                    async with message.channel.typing():
+                        response_text = await self._run_pi_prompt_async(
+                            conversation_key,
+                            prompt,
+                            force_session=force_session,
+                            on_delta=on_delta,
+                        )
+                except asyncio.TimeoutError:
+                    outcome = "timeout"
+                    await self._send_or_edit_response(
+                        message.channel,
+                        status_message,
+                        "That request timed out while waiting for pi. Please try again.",
+                    )
+                    return
+                except pi_error_type as exc:
+                    outcome = "pi_error"
+                    LOGGER.exception("pi_sdk error for message %s: %s", message.id, exc)
+                    await self._send_or_edit_response(message.channel, status_message, f"pi error: {exc}")
+                    return
+                except Exception:
+                    outcome = "unexpected_error"
+                    raise
+
+                if not response_text.strip():
+                    response_text = "I did not get a response from pi for that message."
+
+                await self._publish_final_response(message.channel, status_message, response_text)
+                response_chars = len(response_text)
+
+                LOGGER.info("Run response delivered message=%s conversation=%s", message.id, conversation_key)
+            finally:
+                elapsed_seconds = time.monotonic() - started_at
+                self._record_latency(conversation_key, elapsed_seconds)
+                LOGGER.info(
+                    "Run finished message=%s conversation=%s outcome=%s latency_ms=%.0f response_chars=%s",
+                    message.id,
+                    conversation_key,
+                    outcome,
+                    elapsed_seconds * 1000,
+                    response_chars,
+                )
+
+    async def _send_or_edit_response(
+        self,
+        channel: discord.abc.Messageable,
+        status_message: discord.Message | None,
+        text: str,
+    ) -> None:
+        if status_message is not None:
+            try:
+                await status_message.edit(content=text)
+                return
+            except discord.DiscordException:
+                LOGGER.exception("Failed to edit status message with final response")
+
+        await channel.send(text)
+
+    async def _publish_final_response(
+        self,
+        channel: discord.abc.Messageable,
+        status_message: discord.Message | None,
+        response_text: str,
+    ) -> None:
+        chunks = self._split_for_discord(response_text)
+        first_chunk = chunks[0]
+
+        if status_message is not None:
+            try:
+                await status_message.edit(content=first_chunk)
+            except discord.DiscordException:
+                LOGGER.exception("Failed to edit status message with first response chunk")
+                await channel.send(first_chunk)
+        else:
+            await channel.send(first_chunk)
+
+        for chunk in chunks[1:]:
+            await channel.send(chunk)
+
+    @staticmethod
+    def _stream_preview(text: str, *, limit: int = 2000) -> str:
+        if not text:
+            return "Thinking..."
+        if len(text) <= limit:
+            return text
+
+        header = f"[streaming, {len(text)} chars]\n"
+        tail_size = max(1, limit - len(header))
+        return header + text[-tail_size:]
 
     async def _heartbeat_worker(self) -> None:
         try:
@@ -334,6 +598,27 @@ class PersonalAssistantBot(discord.Client):
             LOGGER.info("Heartbeat worker stopped")
             raise
 
+    async def _session_sweeper_worker(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._pi_session_sweeper_interval_seconds)
+                try:
+                    await self._run_session_sweep_once()
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Unexpected error while sweeping sessions")
+        except asyncio.CancelledError:
+            LOGGER.info("Session sweeper stopped")
+            raise
+
+    async def _metrics_worker(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._metrics_interval_seconds)
+                self._log_health_metrics(source="periodic")
+        except asyncio.CancelledError:
+            LOGGER.info("Metrics worker stopped")
+            raise
+
     async def _run_heartbeat_once(self) -> None:
         _, pi_error_type = _load_pi_sdk()
         heartbeat_key = f"heartbeat-owner-{self._bot_owner_user_id}"
@@ -345,8 +630,18 @@ class PersonalAssistantBot(discord.Client):
             "Reply with a short heartbeat status update only if there's something urgent, "
             "otherwise reply HEARTBEAT_OK."
         )
+
+        heartbeat_lock = self._conversation_lock(heartbeat_key)
         try:
-            heartbeat_response = await self._run_pi_prompt_async(heartbeat_key, heartbeat_prompt, force_ephemeral=True)
+            async with heartbeat_lock:
+                heartbeat_response = await self._run_pi_prompt_async(
+                    heartbeat_key,
+                    heartbeat_prompt,
+                    force_ephemeral=True,
+                )
+        except asyncio.TimeoutError:
+            LOGGER.warning("Heartbeat prompt timed out")
+            return
         except pi_error_type as exc:
             LOGGER.exception("pi_sdk error while running heartbeat prompt: %s", exc)
             return
@@ -360,8 +655,14 @@ class PersonalAssistantBot(discord.Client):
             "Heartbeat update from the bot's heartbeat session.\n"
             f"Heartbeat response: {heartbeat_response}"
         )
+
+        owner_lock = self._conversation_lock(owner_key)
         try:
-            owner_response = await self._run_pi_prompt_async(owner_key, owner_prompt, force_session=True)
+            async with owner_lock:
+                owner_response = await self._run_pi_prompt_async(owner_key, owner_prompt, force_session=True)
+        except asyncio.TimeoutError:
+            LOGGER.warning("Heartbeat forward prompt timed out for owner conversation %s", owner_key)
+            return
         except pi_error_type as exc:
             LOGGER.exception("pi_sdk error while forwarding heartbeat to owner DM session: %s", exc)
             return
@@ -373,6 +674,81 @@ class PersonalAssistantBot(discord.Client):
             await owner_channel.send(chunk)
 
         LOGGER.info("Forwarded heartbeat response into owner DM session %s", owner_key)
+        self._log_health_metrics(source="heartbeat")
+
+    async def _run_session_sweep_once(self) -> None:
+        now = time.monotonic()
+        expired_keys: list[str] = []
+
+        for conversation_key, state in list(self._pi_clients.items()):
+            lock = self._conversation_locks.get(conversation_key)
+            if lock is not None and lock.locked():
+                continue
+            if now - state.last_used_monotonic >= self._session_cleanup_ttl_seconds:
+                expired_keys.append(conversation_key)
+
+        for conversation_key in expired_keys:
+            await self._evict_pi_client(conversation_key, reason="sweeper-idle-expired")
+
+        active_session_dirs = {
+            state.session_dir.resolve()
+            for state in self._pi_clients.values()
+        }
+        deleted_dirs = await asyncio.to_thread(
+            self._prune_stale_session_directories,
+            active_session_dirs,
+            self._session_cleanup_ttl_seconds,
+        )
+
+        if expired_keys or deleted_dirs:
+            LOGGER.info(
+                "Session sweep completed expired_clients=%s deleted_dirs=%s active_sessions=%s",
+                len(expired_keys),
+                deleted_dirs,
+                len(self._pi_clients),
+            )
+
+    def _prune_stale_session_directories(self, active_session_dirs: set[Path], max_age_seconds: int) -> int:
+        if not self._pi_session_root.exists():
+            return 0
+
+        now = time.time()
+        deleted_dirs = 0
+
+        for conversation_dir in self._pi_session_root.iterdir():
+            if not conversation_dir.is_dir():
+                continue
+
+            for session_dir in conversation_dir.iterdir():
+                if not session_dir.is_dir():
+                    continue
+
+                resolved_dir = session_dir.resolve()
+                if resolved_dir in active_session_dirs:
+                    continue
+
+                try:
+                    age_seconds = now - session_dir.stat().st_mtime
+                except OSError:
+                    continue
+
+                if age_seconds < max_age_seconds:
+                    continue
+
+                try:
+                    shutil.rmtree(session_dir)
+                    deleted_dirs += 1
+                except FileNotFoundError:
+                    continue
+                except Exception:  # noqa: BLE001
+                    LOGGER.exception("Failed deleting stale session directory %s", session_dir)
+
+            try:
+                conversation_dir.rmdir()
+            except OSError:
+                continue
+
+        return deleted_dirs
 
     async def _run_pi_prompt_async(
         self,
@@ -381,16 +757,147 @@ class PersonalAssistantBot(discord.Client):
         *,
         force_ephemeral: bool = False,
         force_session: bool = False,
+        on_delta: DeltaHandler | None = None,
     ) -> str:
         if force_ephemeral and force_session:
             raise RuntimeError("force_ephemeral and force_session cannot both be true")
 
-        async with self._pi_lock:
-            if force_ephemeral:
-                return await asyncio.to_thread(self._run_ephemeral_pi_prompt, conversation_key, prompt)
-            if force_session:
-                return await asyncio.to_thread(self._run_pi_prompt_forced_session, conversation_key, prompt)
-            return await asyncio.to_thread(self._run_pi_prompt, conversation_key, prompt)
+        run_coro = self._run_pi_prompt_once(
+            conversation_key,
+            prompt,
+            force_ephemeral=force_ephemeral,
+            force_session=force_session,
+            on_delta=on_delta,
+        )
+
+        if self._pi_call_timeout_seconds <= 0:
+            return await run_coro
+
+        try:
+            return await asyncio.wait_for(run_coro, timeout=self._pi_call_timeout_seconds)
+        except asyncio.TimeoutError:
+            self._timeout_count += 1
+            LOGGER.warning(
+                "Pi call timed out for %s after %ss",
+                conversation_key,
+                self._pi_call_timeout_seconds,
+            )
+            await self._evict_pi_client(conversation_key, reason="timeout")
+            raise
+
+    async def _run_pi_prompt_once(
+        self,
+        conversation_key: str,
+        prompt: str,
+        *,
+        force_ephemeral: bool,
+        force_session: bool,
+        on_delta: DeltaHandler | None,
+    ) -> str:
+        if force_ephemeral or (self._pi_session_ttl_seconds == 0 and not force_session):
+            client, session_dir = await asyncio.to_thread(self._create_pi_client, conversation_key, force_no_session=True)
+            try:
+                response_text = await self._stream_text_from_client_async(
+                    conversation_key,
+                    client,
+                    prompt,
+                    on_delta=on_delta,
+                )
+                LOGGER.info("Returned ephemeral pi response for %s", conversation_key)
+                return response_text.strip()
+            finally:
+                await asyncio.shield(
+                    asyncio.to_thread(
+                        self._close_pi_client,
+                        conversation_key,
+                        client,
+                        session_dir,
+                        True,
+                    )
+                )
+
+        state = await self._get_pi_client(conversation_key, force_session=force_session)
+        state.last_used_monotonic = time.monotonic()
+        try:
+            response_text = await self._stream_text_from_client_async(
+                conversation_key,
+                state.client,
+                prompt,
+                on_delta=on_delta,
+            )
+        finally:
+            state.last_used_monotonic = time.monotonic()
+
+        LOGGER.info("Returned pi response for %s", conversation_key)
+        return response_text.strip()
+
+    async def _stream_text_from_client_async(
+        self,
+        conversation_key: str,
+        client: Any,
+        prompt: str,
+        *,
+        on_delta: DeltaHandler | None,
+    ) -> str:
+        loop = asyncio.get_running_loop()
+        events: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+
+        def emit(event: str, payload: object) -> None:
+            loop.call_soon_threadsafe(events.put_nowait, (event, payload))
+
+        def stream_worker() -> None:
+            try:
+                for delta in client.stream_text(prompt):
+                    emit("delta", delta)
+            except Exception as exc:  # noqa: BLE001
+                emit("error", exc)
+            else:
+                emit("done", None)
+
+        stream_task = asyncio.create_task(asyncio.to_thread(stream_worker), name=f"pi-stream-{conversation_key}")
+        stream_task.add_done_callback(self._discard_task_exception)
+
+        chunks: list[str] = []
+        while True:
+            event, payload = await events.get()
+            if event == "delta":
+                delta = payload if isinstance(payload, str) else str(payload)
+                chunks.append(delta)
+                if on_delta is not None and delta:
+                    await on_delta(delta)
+                continue
+
+            if event == "error":
+                if isinstance(payload, Exception):
+                    raise payload
+                raise RuntimeError("pi stream failed")
+
+            if event == "done":
+                break
+
+        return "".join(chunks)
+
+    @staticmethod
+    def _discard_task_exception(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            LOGGER.exception("PI stream task failed", exc_info=exc)
+
+    async def _evict_pi_client(self, conversation_key: str, *, reason: str) -> None:
+        state = self._pi_clients.pop(conversation_key, None)
+        if state is None:
+            return
+
+        await asyncio.to_thread(
+            self._close_pi_client,
+            conversation_key,
+            state.client,
+            state.session_dir,
+            True,
+        )
+        LOGGER.info("Evicted pi client for %s reason=%s", conversation_key, reason)
 
     async def _get_or_create_owner_dm_channel(self) -> discord.DMChannel:
         owner = self.get_user(self._bot_owner_user_id)
@@ -402,50 +909,34 @@ class PersonalAssistantBot(discord.Client):
             dm_channel = await owner.create_dm()
         return dm_channel
 
-    def _run_ephemeral_pi_prompt(self, conversation_key: str, prompt: str) -> str:
-        client = self._create_pi_client(conversation_key, force_no_session=True)
-        try:
-            response_text = "".join(client.stream_text(prompt)).strip()
-            LOGGER.info("Returned ephemeral pi response for %s", conversation_key)
-            return response_text
-        finally:
-            self._close_pi_client(conversation_key, client)
-
-    def _run_pi_prompt(self, conversation_key: str, prompt: str) -> str:
-        if self._pi_session_ttl_seconds == 0:
-            return self._run_ephemeral_pi_prompt(conversation_key, prompt)
-
-        client = self._get_pi_client(conversation_key)
-        response_text = "".join(client.stream_text(prompt)).strip()
-        LOGGER.info("Returned pi response for %s", conversation_key)
-        return response_text
-
-    def _run_pi_prompt_forced_session(self, conversation_key: str, prompt: str) -> str:
-        client = self._get_pi_client(conversation_key, force_session=True)
-        response_text = "".join(client.stream_text(prompt)).strip()
-        LOGGER.info("Returned pi response for %s", conversation_key)
-        return response_text
-
-    def _get_pi_client(self, conversation_key: str, *, force_session: bool = False) -> Any:
+    async def _get_pi_client(self, conversation_key: str, *, force_session: bool = False) -> PiClientState:
         if self._pi_session_ttl_seconds == 0 and not force_session:
             raise RuntimeError("Session TTL of 0 requires per-message client creation")
 
         now = time.monotonic()
-        pi_rpc_client_class, _ = _load_pi_sdk()
         existing = self._pi_clients.get(conversation_key)
         if existing is not None:
             if force_session and self._pi_session_ttl_seconds == 0:
+                existing.last_used_monotonic = now
                 LOGGER.info("Resuming forced pi session for %s", conversation_key)
-                return existing.client
-            if now - existing.created_at_monotonic < self._pi_session_ttl_seconds:
-                LOGGER.info("Resuming pi session for %s", conversation_key)
-                return existing.client
-            self._close_pi_client(conversation_key, existing.client)
-            del self._pi_clients[conversation_key]
+                return existing
 
-        client = self._create_pi_client(conversation_key, pi_rpc_client_class=pi_rpc_client_class)
-        self._pi_clients[conversation_key] = PiClientState(client=client, created_at_monotonic=now)
-        return client
+            if self._pi_session_ttl_seconds > 0 and now - existing.last_used_monotonic < self._pi_session_ttl_seconds:
+                existing.last_used_monotonic = now
+                LOGGER.info("Resuming pi session for %s", conversation_key)
+                return existing
+
+            await self._evict_pi_client(conversation_key, reason="ttl-expired")
+
+        client, session_dir = await asyncio.to_thread(self._create_pi_client, conversation_key)
+        state = PiClientState(
+            client=client,
+            created_at_monotonic=now,
+            last_used_monotonic=now,
+            session_dir=session_dir,
+        )
+        self._pi_clients[conversation_key] = state
+        return state
 
     def _create_pi_client(
         self,
@@ -453,7 +944,7 @@ class PersonalAssistantBot(discord.Client):
         *,
         force_no_session: bool = False,
         pi_rpc_client_class: Any | None = None,
-    ) -> Any:
+    ) -> tuple[Any, Path]:
         if pi_rpc_client_class is None:
             pi_rpc_client_class, _ = _load_pi_sdk()
 
@@ -464,6 +955,7 @@ class PersonalAssistantBot(discord.Client):
             force_no_session=force_no_session,
             session_dir=session_dir,
         )
+
         try:
             client = pi_rpc_client_class(**kwargs)
         except TypeError as exc:
@@ -473,8 +965,9 @@ class PersonalAssistantBot(discord.Client):
                     "Update your pi_sdk installation."
                 ) from exc
             raise
+
         client.start()
-        return client
+        return client, session_dir
 
     def _build_pi_client_kwargs(self, *, force_no_session: bool, session_dir: Path) -> dict[str, object]:
         kwargs: dict[str, object] = {
@@ -490,16 +983,72 @@ class PersonalAssistantBot(discord.Client):
 
     def _close_pi_clients(self) -> None:
         for key, state in list(self._pi_clients.items()):
-            self._close_pi_client(key, state.client)
+            self._close_pi_client(key, state.client, state.session_dir, True)
         self._pi_clients.clear()
 
     @staticmethod
-    def _close_pi_client(conversation_key: str, client: Any) -> None:
+    def _close_pi_client(
+        conversation_key: str,
+        client: Any,
+        session_dir: Path | None = None,
+        delete_session_dir: bool = False,
+    ) -> None:
         try:
             client.close()
             LOGGER.info("Finished pi session for %s", conversation_key)
         except Exception:  # noqa: BLE001
             LOGGER.exception("Failed closing pi client for %s", conversation_key)
+
+        if delete_session_dir and session_dir is not None:
+            try:
+                shutil.rmtree(session_dir)
+            except FileNotFoundError:
+                return
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Failed deleting session directory %s for %s", session_dir, conversation_key)
+
+    def _record_latency(self, conversation_key: str, elapsed_seconds: float) -> None:
+        self._conversation_latency_seconds[conversation_key].append(elapsed_seconds)
+
+    def _queue_oldest_age_seconds(self) -> float:
+        if not self._queued_message_enqueued_at:
+            return 0.0
+        oldest_enqueued = min(self._queued_message_enqueued_at.values())
+        return max(0.0, time.monotonic() - oldest_enqueued)
+
+    @staticmethod
+    def _percentile(sorted_values: list[float], percentile: float) -> float:
+        if not sorted_values:
+            return 0.0
+        index = int((len(sorted_values) - 1) * percentile)
+        return sorted_values[index]
+
+    def _latency_summary(self) -> dict[str, dict[str, float | int]]:
+        summary: dict[str, dict[str, float | int]] = {}
+        for conversation_key, samples in self._conversation_latency_seconds.items():
+            if not samples:
+                continue
+            values = sorted(samples)
+            summary[conversation_key] = {
+                "count": len(values),
+                "p50_ms": round(self._percentile(values, 0.50) * 1000, 2),
+                "p95_ms": round(self._percentile(values, 0.95) * 1000, 2),
+                "p99_ms": round(self._percentile(values, 0.99) * 1000, 2),
+            }
+        return summary
+
+    def _log_health_metrics(self, *, source: str) -> None:
+        active_runs = sum(1 for lock in self._conversation_locks.values() if lock.locked())
+        LOGGER.info(
+            "Health source=%s queue_depth=%s queue_oldest_age_s=%.2f active_runs=%s active_sessions=%s timeouts=%s latency=%s",
+            source,
+            self.message_queue.qsize(),
+            self._queue_oldest_age_seconds(),
+            active_runs,
+            len(self._pi_clients),
+            self._timeout_count,
+            self._latency_summary(),
+        )
 
     @staticmethod
     def _conversation_key(message: discord.Message) -> str:

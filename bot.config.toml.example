@@ -13,12 +13,24 @@ executable = "pi"
 # It is also exported as PI_CODING_AGENT_DIR to isolate pi settings/extensions/auth from your global ~/.pi/agent.
 # data_dir = "~/Developer/my-project"
 session_root = ".pi_sessions"
-# 0 means every message starts a fresh pi session.
-# Values > 0 keep one session per DM/channel and rotate after this many seconds.
+# 0 means every message starts a fresh pi session (except forced owner/session flows).
+# Values > 0 keep one session per DM/channel and rotate after this many seconds of inactivity.
 session_ttl_seconds = 0
+# 0 disables the timeout. Values > 0 fail calls that exceed the limit.
+call_timeout_seconds = 180
+# 0 disables periodic session cleanup. Values > 0 run cleanup on this interval.
+session_sweeper_interval_seconds = 60
 
 [bot]
 queue_maxsize = 1000
+# Number of concurrent queue workers. Per-conversation locks still preserve ordering per conversation.
+worker_concurrency = 4
 # 0 disables heartbeat, values > 0 run heartbeat on this interval.
 heartbeat_interval_seconds = 300
+# 0 disables periodic health logs, values > 0 emit queue/session/latency telemetry on this interval.
+metrics_interval_seconds = 60
+# Minimum interval between progress message edits while streaming response deltas.
+stream_edit_interval_ms = 700
+# Number of recent per-conversation latencies retained for percentile calculations.
+latency_window_size = 200
 log_level = "INFO"
