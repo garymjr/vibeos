@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,12 +35,6 @@ def load_pi_sdk() -> tuple[Any, type[Exception]]:
     _PI_RPC_CLIENT_CLASS = PiRPCClient
     _PI_RPC_ERROR_CLASS = PiRPCError
     return _PI_RPC_CLIENT_CLASS, _PI_RPC_ERROR_CLASS
-
-
-def get_pi_error_type() -> type[Exception]:
-    _, error_type = load_pi_sdk()
-    return error_type
-
 
 @dataclass(slots=True)
 class PiClientState:
@@ -223,39 +218,76 @@ class PiRuntime:
     ) -> str:
         loop = asyncio.get_running_loop()
         events: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        stop_signal = threading.Event()
 
         def emit(event: str, payload: object) -> None:
-            loop.call_soon_threadsafe(events.put_nowait, (event, payload))
+            try:
+                loop.call_soon_threadsafe(events.put_nowait, (event, payload))
+            except RuntimeError:
+                return
 
         def stream_worker() -> None:
             try:
-                for delta in client.stream_text(prompt):
-                    emit("delta", delta)
+                if self._pi_call_timeout_seconds > 0:
+                    client.prompt(prompt, timeout=self._pi_call_timeout_seconds)
+                else:
+                    client.prompt(prompt)
+
+                while not stop_signal.is_set():
+                    try:
+                        event = client.next_event(timeout=1.0)
+                    except Exception as exc:  # noqa: BLE001
+                        if exc.__class__.__name__ == "PiRPCTimeoutError":
+                            continue
+                        raise
+
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("type") == "agent_end":
+                        break
+                    if event.get("type") != "message_update":
+                        continue
+
+                    assistant_event = event.get("assistantMessageEvent")
+                    if not isinstance(assistant_event, dict):
+                        continue
+                    if assistant_event.get("type") != "text_delta":
+                        continue
+
+                    delta = assistant_event.get("delta")
+                    if isinstance(delta, str):
+                        emit("delta", delta)
             except Exception as exc:  # noqa: BLE001
                 emit("error", exc)
             else:
                 emit("done", None)
 
-        stream_task = asyncio.create_task(asyncio.to_thread(stream_worker), name=f"pi-stream-{conversation_key}")
-        stream_task.add_done_callback(self._discard_task_exception)
+        threading.Thread(
+            target=stream_worker,
+            name=f"pi-stream-{conversation_key}",
+            daemon=True,
+        ).start()
 
         chunks: list[str] = []
-        while True:
-            event, payload = await events.get()
-            if event == "delta":
-                delta = payload if isinstance(payload, str) else str(payload)
-                chunks.append(delta)
-                if on_delta is not None and delta:
-                    await on_delta(delta)
-                continue
+        try:
+            while True:
+                event, payload = await events.get()
+                if event == "delta":
+                    delta = payload if isinstance(payload, str) else str(payload)
+                    chunks.append(delta)
+                    if on_delta is not None and delta:
+                        await on_delta(delta)
+                    continue
 
-            if event == "error":
-                if isinstance(payload, Exception):
-                    raise payload
-                raise RuntimeError("pi stream failed")
+                if event == "error":
+                    if isinstance(payload, Exception):
+                        raise payload
+                    raise RuntimeError("pi stream failed")
 
-            if event == "done":
-                break
+                if event == "done":
+                    break
+        finally:
+            stop_signal.set()
 
         return "".join(chunks)
 
@@ -398,11 +430,3 @@ class PiRuntime:
                 return
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Failed deleting session directory %s for %s", session_dir, conversation_key)
-
-    @staticmethod
-    def _discard_task_exception(task: asyncio.Task[Any]) -> None:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            LOGGER.exception("PI stream task failed", exc_info=exc)
