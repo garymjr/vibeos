@@ -11,6 +11,8 @@ Telegram bot using `python-telegram-bot` with a bounded concurrent queue worker 
 - Multiple workers process queued messages concurrently.
 - Per-conversation locks preserve message ordering within each DM/chat.
 - Streams response deltas into a progress message before posting the final response.
+- Consumes PI `tool_execution_end` events and executes OpenClaw-style outbound sends (`action: "sendMessage"` with `to` + `content`/`message`/`text`) through Telegram.
+- When outbound send actions are executed, the bot suppresses echoing the raw final model text and posts a short delivery summary instead.
 
 ## Requirements
 

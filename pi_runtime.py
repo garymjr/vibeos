@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import threading
@@ -17,6 +18,7 @@ _PI_RPC_CLIENT_CLASS: Any | None = None
 _PI_RPC_ERROR_CLASS: type[Exception] = Exception
 
 DeltaHandler = Callable[[str], Awaitable[None]]
+ToolExecutionHandler = Callable[["PiToolExecution"], Awaitable[None]]
 
 
 def load_pi_sdk() -> tuple[Any, type[Exception]]:
@@ -36,12 +38,22 @@ def load_pi_sdk() -> tuple[Any, type[Exception]]:
     _PI_RPC_ERROR_CLASS = PiRPCError
     return _PI_RPC_CLIENT_CLASS, _PI_RPC_ERROR_CLASS
 
+
 @dataclass(slots=True)
 class PiClientState:
     client: Any
     created_at_monotonic: float
     last_used_monotonic: float
     session_dir: Path
+
+
+@dataclass(slots=True)
+class PiToolExecution:
+    tool_call_id: str | None
+    tool_name: str
+    args: dict[str, Any]
+    result: Any
+    is_error: bool
 
 
 class PiRuntime:
@@ -93,6 +105,7 @@ class PiRuntime:
         force_ephemeral: bool = False,
         force_session: bool = False,
         on_delta: DeltaHandler | None = None,
+        on_tool_execution: ToolExecutionHandler | None = None,
     ) -> str:
         if force_ephemeral and force_session:
             raise RuntimeError("force_ephemeral and force_session cannot both be true")
@@ -103,6 +116,7 @@ class PiRuntime:
             force_ephemeral=force_ephemeral,
             force_session=force_session,
             on_delta=on_delta,
+            on_tool_execution=on_tool_execution,
         )
 
         if self._pi_call_timeout_seconds <= 0:
@@ -166,6 +180,7 @@ class PiRuntime:
         force_ephemeral: bool,
         force_session: bool,
         on_delta: DeltaHandler | None,
+        on_tool_execution: ToolExecutionHandler | None,
     ) -> str:
         if force_ephemeral or (self._pi_session_ttl_seconds == 0 and not force_session):
             client, session_dir = await asyncio.to_thread(
@@ -179,6 +194,7 @@ class PiRuntime:
                     client,
                     prompt,
                     on_delta=on_delta,
+                    on_tool_execution=on_tool_execution,
                 )
                 LOGGER.debug("Returned ephemeral pi response for %s", conversation_key)
                 return response_text.strip()
@@ -201,6 +217,7 @@ class PiRuntime:
                 state.client,
                 prompt,
                 on_delta=on_delta,
+                on_tool_execution=on_tool_execution,
             )
         finally:
             state.last_used_monotonic = time.monotonic()
@@ -215,6 +232,7 @@ class PiRuntime:
         prompt: str,
         *,
         on_delta: DeltaHandler | None,
+        on_tool_execution: ToolExecutionHandler | None,
     ) -> str:
         loop = asyncio.get_running_loop()
         events: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
@@ -245,7 +263,13 @@ class PiRuntime:
                         continue
                     if event.get("type") == "agent_end":
                         break
-                    if event.get("type") != "message_update":
+                    event_type = event.get("type")
+                    if event_type == "tool_execution_end":
+                        tool_execution = _parse_tool_execution_end_event(event)
+                        if tool_execution is not None:
+                            emit("tool_execution", tool_execution)
+                        continue
+                    if event_type != "message_update":
                         continue
 
                     assistant_event = event.get("assistantMessageEvent")
@@ -277,6 +301,11 @@ class PiRuntime:
                     chunks.append(delta)
                     if on_delta is not None and delta:
                         await on_delta(delta)
+                    continue
+
+                if event == "tool_execution":
+                    if on_tool_execution is not None and isinstance(payload, PiToolExecution):
+                        await on_tool_execution(payload)
                     continue
 
                 if event == "error":
@@ -430,3 +459,54 @@ class PiRuntime:
                 return
             except Exception:  # noqa: BLE001
                 LOGGER.exception("Failed deleting session directory %s for %s", session_dir, conversation_key)
+
+
+def _parse_tool_execution_end_event(event: dict[str, Any]) -> PiToolExecution | None:
+    tool_call = event.get("toolCall")
+    tool_name = event.get("toolName") or event.get("tool_name")
+    if tool_name is None and isinstance(tool_call, dict):
+        tool_name = tool_call.get("name")
+    if not isinstance(tool_name, str):
+        return None
+
+    raw_args = event.get("args")
+    if raw_args is None:
+        raw_args = event.get("arguments")
+    if raw_args is None and isinstance(tool_call, dict):
+        raw_args = tool_call.get("arguments")
+    parsed_args: dict[str, Any]
+    if isinstance(raw_args, dict):
+        parsed_args = raw_args
+    elif isinstance(raw_args, str):
+        try:
+            decoded = json.loads(raw_args)
+        except json.JSONDecodeError:
+            parsed_args = {}
+        else:
+            parsed_args = decoded if isinstance(decoded, dict) else {}
+    else:
+        parsed_args = {}
+
+    tool_call_id = event.get("toolCallId")
+    if tool_call_id is None:
+        tool_call_id = event.get("tool_call_id")
+    if tool_call_id is None and isinstance(tool_call, dict):
+        tool_call_id = tool_call.get("id")
+    if not isinstance(tool_call_id, str):
+        tool_call_id = None
+
+    raw_is_error = event.get("isError", False)
+    if isinstance(raw_is_error, bool):
+        is_error = raw_is_error
+    elif isinstance(raw_is_error, str):
+        is_error = raw_is_error.strip().lower() in {"1", "true", "yes"}
+    else:
+        is_error = bool(raw_is_error)
+
+    return PiToolExecution(
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        args=parsed_args,
+        result=event.get("result"),
+        is_error=is_error,
+    )

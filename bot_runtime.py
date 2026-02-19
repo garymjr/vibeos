@@ -21,7 +21,12 @@ from message_utils import (
     split_for_telegram,
     stream_preview,
 )
-from pi_runtime import PiRuntime, load_pi_sdk
+from outbound_actions import (
+    OutboundActionParseError,
+    TelegramSendAction,
+    extract_openclaw_send_action,
+)
+from pi_runtime import PiRuntime, PiToolExecution, load_pi_sdk
 from telemetry import LatencyTracker
 
 LOGGER = logging.getLogger("assistant.bot")
@@ -252,6 +257,9 @@ class PersonalAssistantBot:
             status_updates_enabled = True
             streamed_text = ""
             last_edit_at = 0.0
+            executed_send_action_keys: set[str] = set()
+            outbound_messages_sent = 0
+            outbound_send_failures = 0
 
             try:
                 status_message = await self._send_text(message.chat_id, "Thinking...")
@@ -285,6 +293,60 @@ class PersonalAssistantBot:
                     status_updates_enabled = False
                     LOGGER.exception("Failed to edit streaming response for %s", message.message_id)
 
+            async def on_tool_execution(execution: PiToolExecution) -> None:
+                nonlocal outbound_messages_sent, outbound_send_failures
+                if execution.is_error:
+                    return
+
+                try:
+                    send_action = extract_openclaw_send_action(
+                        tool_name=execution.tool_name,
+                        args=execution.args,
+                        default_chat_id=message.chat_id,
+                    )
+                except OutboundActionParseError as exc:
+                    LOGGER.warning(
+                        "Invalid outbound send action message=%s tool=%s call_id=%s error=%s",
+                        message.message_id,
+                        execution.tool_name,
+                        execution.tool_call_id,
+                        exc,
+                    )
+                    return
+
+                if send_action is None:
+                    return
+
+                action_key = execution.tool_call_id
+                if action_key is None:
+                    action_key = f"{execution.tool_name}:{send_action.to}:{send_action.text}"
+                if action_key in executed_send_action_keys:
+                    LOGGER.debug(
+                        "Skipping duplicate outbound send action message=%s key=%s",
+                        message.message_id,
+                        action_key,
+                    )
+                    return
+
+                executed_send_action_keys.add(action_key)
+                try:
+                    await self._deliver_outbound_send_action(
+                        source_message=message,
+                        action=send_action,
+                        tool_name=execution.tool_name,
+                        tool_call_id=execution.tool_call_id,
+                    )
+                    outbound_messages_sent += 1
+                except TelegramError:
+                    outbound_send_failures += 1
+                    LOGGER.exception(
+                        "Failed delivering outbound send action message=%s tool=%s call_id=%s target=%s",
+                        message.message_id,
+                        execution.tool_name,
+                        execution.tool_call_id,
+                        send_action.to,
+                    )
+
             try:
                 try:
                     await self._send_chat_action(message.chat_id, ChatAction.TYPING)
@@ -293,6 +355,7 @@ class PersonalAssistantBot:
                         prompt,
                         force_session=force_session,
                         on_delta=on_delta,
+                        on_tool_execution=on_tool_execution,
                     )
                 except asyncio.TimeoutError:
                     outcome = "timeout"
@@ -313,6 +376,21 @@ class PersonalAssistantBot:
 
                 if not response_text.strip():
                     response_text = "I did not get a response from pi for that message."
+
+                if outbound_messages_sent > 0:
+                    summary = f"Sent {outbound_messages_sent} outbound message(s)."
+                    if outbound_send_failures > 0:
+                        summary = f"{summary} Failed sends: {outbound_send_failures}."
+                    await self._send_or_edit_response(message.chat_id, status_message, summary)
+                    response_chars = 0
+                    LOGGER.info(
+                        "Suppressed direct response message=%s conversation=%s outbound_sent=%s outbound_failed=%s",
+                        message.message_id,
+                        conversation_key_value,
+                        outbound_messages_sent,
+                        outbound_send_failures,
+                    )
+                    return
 
                 await self._publish_final_response(message.chat_id, status_message, response_text)
                 response_chars = len(response_text)
@@ -335,7 +413,7 @@ class PersonalAssistantBot:
 
     async def _send_or_edit_response(
         self,
-        chat_id: int,
+        chat_id: int | str,
         status_message: Message | None,
         text: str,
     ) -> None:
@@ -350,7 +428,7 @@ class PersonalAssistantBot:
 
     async def _publish_final_response(
         self,
-        chat_id: int,
+        chat_id: int | str,
         status_message: Message | None,
         response_text: str,
     ) -> None:
@@ -374,9 +452,47 @@ class PersonalAssistantBot:
             raise RuntimeError("Telegram application is not initialized")
         return self._application
 
-    async def _send_text(self, chat_id: int, text: str) -> Message:
+    async def _send_text(
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+    ) -> Message:
         application = self._require_application()
-        return await application.bot.send_message(chat_id=chat_id, text=text)
+        return await application.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message_thread_id,
+        )
+
+    async def _deliver_outbound_send_action(
+        self,
+        *,
+        source_message: Message,
+        action: TelegramSendAction,
+        tool_name: str,
+        tool_call_id: str | None,
+    ) -> None:
+        chunks = split_for_telegram(action.text)
+        for index, chunk in enumerate(chunks):
+            await self._send_text(
+                action.to,
+                chunk,
+                message_thread_id=action.message_thread_id,
+                reply_to_message_id=action.reply_to_message_id if index == 0 else None,
+            )
+        LOGGER.info(
+            "Delivered outbound send action source_message=%s tool=%s call_id=%s target=%s chunks=%s chars=%s",
+            source_message.message_id,
+            tool_name,
+            tool_call_id,
+            action.to,
+            len(chunks),
+            len(action.text),
+        )
 
     async def _send_chat_action(self, chat_id: int, action: str) -> None:
         application = self._require_application()
